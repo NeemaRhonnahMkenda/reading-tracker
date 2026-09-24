@@ -1,6 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { BrowserMultiFormatReader } from "@zxing/browser";
+
 import Navbar from "../components/Navbar";
 import { supabase } from "../../lib/supabase";
 
@@ -45,6 +47,19 @@ export default function Library() {
   const [searchingBook, setSearchingBook] = useState(false);
   const [bookError, setBookError] = useState("");
 
+  // Barcode scanner
+  const [scanning, setScanning] = useState(false);
+  const [scannerError, setScannerError] = useState("");
+
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+
+  const scannerControlsRef = useRef<{
+    stop: () => void;
+  } | null>(null);
+
+  const hasScannedRef = useRef(false);
+
   // Book status
   const [status, setStatus] = useState("want_to_read");
 
@@ -58,62 +73,88 @@ export default function Library() {
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("all");
 
-// --------------------------------------------------
-// Get authenticated user
-// --------------------------------------------------
+  // --------------------------------------------------
+  // Get authenticated user
+  // --------------------------------------------------
 
-useEffect(() => {
-  getCurrentUser();
+  useEffect(() => {
+    getCurrentUser();
 
-  const {
-    data: { subscription },
-  } = supabase.auth.onAuthStateChange((_event, session) => {
-    if (session?.user) {
-      setUserId(session.user.id);
-      fetchBooks();
-    } else {
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (session?.user) {
+        setUserId(session.user.id);
+        fetchBooks();
+      } else {
+        setUserId(null);
+        setBooks([]);
+      }
+    });
+
+    return () => {
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  // --------------------------------------------------
+  // Clean up barcode scanner when page closes
+  // --------------------------------------------------
+
+  useEffect(() => {
+    return () => {
+      if (scannerControlsRef.current) {
+        scannerControlsRef.current.stop();
+        scannerControlsRef.current = null;
+      }
+
+      if (streamRef.current) {
+        streamRef.current
+          .getTracks()
+          .forEach((track) => track.stop());
+
+        streamRef.current = null;
+      }
+
+      if (videoRef.current) {
+        videoRef.current.pause();
+        videoRef.current.srcObject = null;
+      }
+    };
+  }, []);
+
+  async function getCurrentUser() {
+    setLoading(true);
+
+    const {
+      data: { session },
+      error,
+    } = await supabase.auth.getSession();
+
+    if (error) {
+      console.error("Error getting Supabase session:", error);
+      setUserId(null);
+      setLoading(false);
+      return;
+    }
+
+    if (!session?.user) {
+      console.error("No authenticated Supabase session found.");
       setUserId(null);
       setBooks([]);
+      setLoading(false);
+      return;
     }
-  });
 
-  return () => {
-    subscription.unsubscribe();
-  };
-}, []);
+    console.log("Authenticated user:", session.user);
+    console.log("Authenticated user ID:", session.user.id);
 
-async function getCurrentUser() {
-  setLoading(true);
+    setUserId(session.user.id);
 
-  const {
-    data: { session },
-    error,
-  } = await supabase.auth.getSession();
+    await fetchBooks();
 
-  if (error) {
-    console.error("Error getting Supabase session:", error);
-    setUserId(null);
     setLoading(false);
-    return;
   }
-
-  if (!session?.user) {
-    console.error("No authenticated Supabase session found.");
-    setUserId(null);
-    setBooks([]);
-    setLoading(false);
-    return;
-  }
-
-  console.log("Authenticated user:", session.user);
-  console.log("Authenticated user ID:", session.user.id);
-
-  setUserId(session.user.id);
-
-  await fetchBooks();
-
-  setLoading(false);
-}
 
   // --------------------------------------------------
   // Fetch books from Supabase
@@ -136,11 +177,16 @@ async function getCurrentUser() {
   // Search for book by ISBN
   // --------------------------------------------------
 
-  async function searchBook() {
-    const cleanISBN = isbn.replace(/[-\s]/g, "");
+  async function searchBookByISBN(isbnValue: string) {
+    const cleanISBN = isbnValue.replace(/[-\s]/g, "");
 
     if (!cleanISBN) {
       setBookError("Please enter an ISBN.");
+      return;
+    }
+
+    if (!/^(?:\d{10}|\d{13})$/.test(cleanISBN)) {
+      setBookError("Please enter a valid ISBN-10 or ISBN-13.");
       return;
     }
 
@@ -174,87 +220,238 @@ async function getCurrentUser() {
     }
   }
 
+  async function searchBook() {
+    await searchBookByISBN(isbn);
+  }
+
+  // --------------------------------------------------
+  // Start barcode scanner
+  // --------------------------------------------------
+
+  async function startBarcodeScanner() {
+    setScannerError("");
+    setBookError("");
+    setScanning(true);
+
+    hasScannedRef.current = false;
+
+    try {
+      const devices =
+        await BrowserMultiFormatReader.listVideoInputDevices();
+
+      if (devices.length === 0) {
+        setScannerError(
+          "No camera was found. Please enter the ISBN manually."
+        );
+
+        setScanning(false);
+        return;
+      }
+
+      const backCamera =
+        devices.find((device) =>
+          device.label.toLowerCase().includes("back")
+        ) || devices[0];
+
+      const codeReader = new BrowserMultiFormatReader();
+
+      const controls = await codeReader.decodeFromVideoDevice(
+        backCamera.deviceId,
+        videoRef.current!,
+        async (result) => {
+          if (!result) {
+            return;
+          }
+
+          // Prevent multiple searches from the same barcode
+          if (hasScannedRef.current) {
+            return;
+          }
+
+          const scannedValue = result.getText();
+
+          console.log("Scanned barcode:", scannedValue);
+
+          const cleanBarcode = scannedValue.replace(
+            /[-\s]/g,
+            ""
+          );
+
+          // Ignore barcodes that are not valid ISBNs
+          if (
+            !/^(?:\d{10}|\d{13})$/.test(cleanBarcode)
+          ) {
+            setScannerError(
+              "The scanned barcode does not look like a valid ISBN. Please try again."
+            );
+
+            return;
+          }
+
+          // Mark as scanned BEFORE doing anything else
+          hasScannedRef.current = true;
+
+          console.log("Detected ISBN:", cleanBarcode);
+
+          // Stop ZXing's continuous decoding
+          if (scannerControlsRef.current) {
+            scannerControlsRef.current.stop();
+            scannerControlsRef.current = null;
+          }
+
+          // Stop the camera
+          if (streamRef.current) {
+            streamRef.current
+              .getTracks()
+              .forEach((track) => track.stop());
+
+            streamRef.current = null;
+          }
+
+          if (videoRef.current) {
+            videoRef.current.pause();
+            videoRef.current.srcObject = null;
+          }
+
+          setScanning(false);
+
+          // Put the ISBN into the input
+          setIsbn(cleanBarcode);
+
+          // Search only ONCE
+          await searchBookByISBN(cleanBarcode);
+        }
+      );
+
+      scannerControlsRef.current = controls;
+    } catch (error) {
+      console.error("Barcode scanner error:", error);
+
+      stopBarcodeScanner();
+
+      setScannerError(
+        "We couldn't access your camera. Please allow camera access or enter the ISBN manually."
+      );
+    }
+  }
+
+  // --------------------------------------------------
+  // Stop barcode scanner
+  // --------------------------------------------------
+
+  function stopBarcodeScanner() {
+    // Stop ZXing's barcode decoding
+    if (scannerControlsRef.current) {
+      scannerControlsRef.current.stop();
+      scannerControlsRef.current = null;
+    }
+
+    // Stop the camera stream
+    if (streamRef.current) {
+      streamRef.current
+        .getTracks()
+        .forEach((track) => track.stop());
+
+      streamRef.current = null;
+    }
+
+    // Clear the video element
+    if (videoRef.current) {
+      videoRef.current.pause();
+      videoRef.current.srcObject = null;
+    }
+
+    hasScannedRef.current = false;
+
+    setScanning(false);
+  }
+
   // --------------------------------------------------
   // Add book to Supabase
   // --------------------------------------------------
 
-async function addBookToLibrary() {
-  if (!bookResult) {
-    setBookError("Please find a book before adding it.");
-    return;
-  }
-
-  if (!bookResult.title) {
-    setBookError("This book does not have a title.");
-    return;
-  }
-
-  if (!userId) {
-    setBookError("You need to be logged in to add a book.");
-    return;
-  }
-
-  setAddingBook(true);
-  setBookError("");
-
-  try {
-    console.log("Adding book for user:", userId);
-
-    const { data, error } = await supabase
-      .from("books")
-      .insert([
-        {
-          user_id: userId,
-          title: bookResult.title,
-          author: bookResult.author,
-          isbn_10: bookResult.isbn10,
-          isbn_13: bookResult.isbn13,
-          binding: bookResult.binding,
-          published_date: formatPublishedDate(
-            bookResult.publishedDate
-          ),
-          publisher: bookResult.publisher,
-          pages: bookResult.pages,
-          cover_url: bookResult.coverUrl,
-          open_library_id: bookResult.openLibraryId,
-          status: status,
-          bought_from: boughtFrom || null,
-          added_at: new Date().toISOString(),
-        },
-      ])
-      .select()
-      .single();
-
-    if (error) {
-      console.error("Error adding book:", error);
-
-      setBookError(
-        `Could not add the book: ${error.message}`
-      );
-
+  async function addBookToLibrary() {
+    if (!bookResult) {
+      setBookError("Please find a book before adding it.");
       return;
     }
 
-    console.log("Book successfully added:", data);
-
-    if (data) {
-      setBooks((currentBooks) => [
-        data,
-        ...currentBooks,
-      ]);
+    if (!bookResult.title) {
+      setBookError("This book does not have a title.");
+      return;
     }
 
-    closeAddBookModal();
-  } catch (error) {
-    console.error("Unexpected error adding the book:", error);
+    if (!userId) {
+      setBookError(
+        "You need to be logged in to add a book."
+      );
+      return;
+    }
 
-    setBookError(
-      "Something went wrong while adding the book."
-    );
-  } finally {
-    setAddingBook(false);
+    setAddingBook(true);
+    setBookError("");
+
+    try {
+      console.log("Adding book for user:", userId);
+
+      const { data, error } = await supabase
+        .from("books")
+        .insert([
+          {
+            user_id: userId,
+            title: bookResult.title,
+            author: bookResult.author,
+            isbn_10: bookResult.isbn10,
+            isbn_13: bookResult.isbn13,
+            binding: bookResult.binding,
+            published_date: formatPublishedDate(
+              bookResult.publishedDate
+            ),
+            publisher: bookResult.publisher,
+            pages: bookResult.pages,
+            cover_url: bookResult.coverUrl,
+            open_library_id: bookResult.openLibraryId,
+            status: status,
+            bought_from: boughtFrom || null,
+            added_at: new Date().toISOString(),
+          },
+        ])
+        .select()
+        .single();
+
+      if (error) {
+        console.error("Error adding book:", error);
+
+        setBookError(
+          `Could not add the book: ${error.message}`
+        );
+
+        return;
+      }
+
+      console.log("Book successfully added:", data);
+
+      if (data) {
+        setBooks((currentBooks) => [
+          data,
+          ...currentBooks,
+        ]);
+      }
+
+      closeAddBookModal();
+    } catch (error) {
+      console.error(
+        "Unexpected error adding the book:",
+        error
+      );
+
+      setBookError(
+        "Something went wrong while adding the book."
+      );
+    } finally {
+      setAddingBook(false);
+    }
   }
-}
 
   // --------------------------------------------------
   // Convert Open Library date into YYYY-MM-DD
@@ -281,9 +478,12 @@ async function addBookToLibrary() {
   // --------------------------------------------------
 
   function closeAddBookModal() {
+    stopBarcodeScanner();
+
     setShowAddBook(false);
     setBookResult(null);
     setBookError("");
+    setScannerError("");
     setIsbn("");
     setStatus("want_to_read");
     setBoughtFrom("");
@@ -298,13 +498,16 @@ async function addBookToLibrary() {
     const searchTerm = search.toLowerCase();
 
     const matchesSearch =
-      book.title.toLowerCase().includes(searchTerm) ||
+      book.title
+        .toLowerCase()
+        .includes(searchTerm) ||
       (book.author || "")
         .toLowerCase()
         .includes(searchTerm);
 
     const matchesFilter =
-      filter === "all" || book.status === filter;
+      filter === "all" ||
+      book.status === filter;
 
     return matchesSearch && matchesFilter;
   });
@@ -344,17 +547,20 @@ async function addBookToLibrary() {
       />
 
       {/* Background atmosphere */}
+
       <div className="absolute top-0 left-1/2 -translate-x-1/2 w-[900px] h-[500px] bg-[#d8d0e3]/20 rounded-full blur-[130px] -z-10 pointer-events-none" />
 
       <div className="absolute top-[500px] -right-40 w-[600px] h-[600px] bg-[#89a08a]/10 rounded-full blur-[130px] -z-10 pointer-events-none" />
 
       {/* Navbar */}
+
       <Navbar isLoggedIn={!!userId} />
 
       {/* Main Library Content */}
-      <section className="max-w-6xl mx-auto px-8 pt-10 pb-24 relative z-10">
 
+      <section className="max-w-6xl mx-auto px-8 pt-10 pb-24 relative z-10">
         {/* Header */}
+
         <div className="flex flex-col md:flex-row md:items-end justify-between gap-8 mb-12">
           <div>
             <p className="uppercase tracking-[0.25em] text-sm text-[#7a947c] font-medium mb-3">
@@ -366,8 +572,8 @@ async function addBookToLibrary() {
             </h1>
 
             <p className="mt-4 text-slate-600 font-light max-w-xl text-lg">
-              A home for the books you&apos;ve read, are reading,
-              and hope to read.
+              A home for the books you&apos;ve read,
+              are reading, and hope to read.
             </p>
           </div>
 
@@ -383,8 +589,8 @@ async function addBookToLibrary() {
         </div>
 
         {/* Statistics */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-10">
 
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-10">
           <div className="bg-white border border-[#0f172a]/5 rounded-xl p-6 shadow-sm">
             <p className="text-sm uppercase tracking-wider text-slate-400 mb-2">
               Total Books
@@ -403,7 +609,8 @@ async function addBookToLibrary() {
             <p className="text-3xl font-classical text-[#0f172a]">
               {
                 books.filter(
-                  (book) => book.status === "reading"
+                  (book) =>
+                    book.status === "reading"
                 ).length
               }
             </p>
@@ -417,7 +624,8 @@ async function addBookToLibrary() {
             <p className="text-3xl font-classical text-[#0f172a]">
               {
                 books.filter(
-                  (book) => book.status === "finished"
+                  (book) =>
+                    book.status === "finished"
                 ).length
               }
             </p>
@@ -425,8 +633,8 @@ async function addBookToLibrary() {
         </div>
 
         {/* Search + Filters */}
-        <div className="flex flex-col md:flex-row gap-4 justify-between mb-10">
 
+        <div className="flex flex-col md:flex-row gap-4 justify-between mb-10">
           <div className="relative w-full md:max-w-md">
             <input
               type="text"
@@ -461,12 +669,13 @@ async function addBookToLibrary() {
               <button
                 key={item.value}
                 type="button"
-                onClick={() => setFilter(item.value)}
-                className={`px-5 py-2.5 rounded-full text-sm transition-all ${
-                  filter === item.value
-                    ? "bg-[#0f172a] text-[#Fdfaf3]"
-                    : "bg-white text-slate-600 border border-slate-200 hover:border-[#7a947c] hover:text-[#7a947c]"
-                }`}
+                onClick={() =>
+                  setFilter(item.value)
+                }
+                className={`px-5 py-2.5 rounded-full text-sm transition-all ${filter === item.value
+                  ? "bg-[#0f172a] text-[#Fdfaf3]"
+                  : "bg-white text-slate-600 border border-slate-200 hover:border-[#7a947c] hover:text-[#7a947c]"
+                  }`}
               >
                 {item.label}
               </button>
@@ -475,6 +684,7 @@ async function addBookToLibrary() {
         </div>
 
         {/* Book Grid / Empty State */}
+
         {loading ? (
           <div className="flex justify-center py-24">
             <div className="w-8 h-8 border-2 border-[#7a947c]/30 border-t-[#7a947c] rounded-full animate-spin" />
@@ -492,13 +702,15 @@ async function addBookToLibrary() {
             </h2>
 
             <p className="text-slate-500 font-light mt-3 max-w-md mx-auto">
-              Add your first book to begin building your
-              personal archive.
+              Add your first book to begin building
+              your personal archive.
             </p>
 
             <button
               type="button"
-              onClick={() => setShowAddBook(true)}
+              onClick={() =>
+                setShowAddBook(true)
+              }
               disabled={!userId}
               className="mt-7 bg-[#7a947c] text-[#Fdfaf3] px-7 py-3 rounded-full hover:bg-[#6b826c] disabled:opacity-50 disabled:cursor-not-allowed transition-all"
             >
@@ -513,6 +725,7 @@ async function addBookToLibrary() {
                 className="group"
               >
                 {/* Book Cover */}
+
                 <div className="aspect-[2/3] bg-[#e9e4d9] rounded-lg overflow-hidden shadow-md group-hover:shadow-xl group-hover:-translate-y-1 transition-all duration-300">
                   {book.cover_url ? (
                     <img
@@ -546,6 +759,7 @@ async function addBookToLibrary() {
                 </div>
 
                 {/* Book Details */}
+
                 <div className="mt-4">
                   <h3 className="font-classical font-semibold text-lg text-[#0f172a] leading-tight">
                     {book.title}
@@ -568,18 +782,22 @@ async function addBookToLibrary() {
       </section>
 
       {/* ADD BOOK MODAL */}
+
       {showAddBook && (
         <div
           className="fixed inset-0 z-50 bg-[#0f172a]/40 backdrop-blur-sm flex items-center justify-center px-5 py-8 overflow-y-auto"
           onMouseDown={(event) => {
-            if (event.target === event.currentTarget) {
+            if (
+              event.target ===
+              event.currentTarget
+            ) {
               closeAddBookModal();
             }
           }}
         >
           <div className="w-full max-w-2xl bg-[#Fdfaf3] rounded-2xl shadow-2xl p-8 md:p-10">
-
             {/* Modal Header */}
+
             <div className="flex items-start justify-between mb-8">
               <div>
                 <p className="uppercase tracking-[0.2em] text-xs text-[#7a947c] mb-2">
@@ -591,7 +809,8 @@ async function addBookToLibrary() {
                 </h2>
 
                 <p className="text-slate-500 font-light mt-2">
-                  Enter an ISBN and we&apos;ll find the book for you.
+                  Enter an ISBN or scan the barcode
+                  on your book.
                 </p>
               </div>
 
@@ -604,8 +823,9 @@ async function addBookToLibrary() {
               </button>
             </div>
 
-            {/* ISBN Search */}
-            <div className="space-y-3">
+            {/* ISBN Search / Barcode Scanner */}
+
+            <div className="space-y-4">
               <label
                 htmlFor="isbn"
                 className="block text-sm font-medium text-slate-700"
@@ -621,6 +841,7 @@ async function addBookToLibrary() {
                   onChange={(event) => {
                     setIsbn(event.target.value);
                     setBookError("");
+                    setScannerError("");
                   }}
                   onKeyDown={(event) => {
                     if (event.key === "Enter") {
@@ -635,7 +856,9 @@ async function addBookToLibrary() {
                 <button
                   type="button"
                   onClick={searchBook}
-                  disabled={searchingBook}
+                  disabled={
+                    searchingBook || scanning
+                  }
                   className="h-12 px-6 bg-[#0f172a] text-[#Fdfaf3] rounded-lg hover:bg-[#1b2940] disabled:opacity-50 transition-all"
                 >
                   {searchingBook
@@ -644,12 +867,88 @@ async function addBookToLibrary() {
                 </button>
               </div>
 
+              {/* OR divider */}
+
+              <div className="flex items-center gap-3">
+                <div className="h-px bg-slate-200 flex-1" />
+
+                <span className="text-xs uppercase tracking-widest text-slate-400">
+                  or
+                </span>
+
+                <div className="h-px bg-slate-200 flex-1" />
+              </div>
+
+              {/* Scan Button / Camera */}
+
+              {!scanning ? (
+                <button
+                  type="button"
+                  onClick={startBarcodeScanner}
+                  disabled={searchingBook}
+                  className="w-full h-12 border border-[#7a947c] text-[#7a947c] rounded-lg hover:bg-[#7a947c] hover:text-[#Fdfaf3] disabled:opacity-50 transition-all flex items-center justify-center gap-2"
+                >
+                  <span className="text-lg">
+                    ▣
+                  </span>
+
+                  <span>
+                    Scan Book Barcode
+                  </span>
+                </button>
+              ) : (
+                <div className="space-y-3">
+                  <div className="relative overflow-hidden rounded-xl bg-[#0f172a] aspect-video">
+                    <video
+                      ref={videoRef}
+                      className="w-full h-full object-cover"
+                      muted
+                      playsInline
+                    />
+
+                    {/* Scanner guide */}
+
+                    <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                      <div className="w-[75%] h-24 border-2 border-white/80 rounded-lg shadow-lg" />
+                    </div>
+
+                    {/* Scanner instruction */}
+
+                    <div className="absolute bottom-3 left-0 right-0 text-center">
+                      <span className="inline-block bg-[#0f172a]/80 text-white text-xs px-4 py-2 rounded-full">
+                        Point your camera at the
+                        book barcode
+                      </span>
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={stopBarcodeScanner}
+                    className="w-full h-11 border border-slate-200 text-slate-600 rounded-lg hover:border-[#0f172a] hover:text-[#0f172a] transition-all"
+                  >
+                    Cancel Scan
+                  </button>
+                </div>
+              )}
+
               <p className="text-xs text-slate-400">
-                You can enter an ISBN-10 or ISBN-13.
+                Enter an ISBN-10 or ISBN-13 manually,
+                or scan the barcode on the back of
+                your book.
               </p>
+
+              {/* Scanner Error */}
+
+              {scannerError && (
+                <div className="px-4 py-3 rounded-lg bg-red-50 border border-red-100 text-red-700 text-sm">
+                  {scannerError}
+                </div>
+              )}
             </div>
 
             {/* Search Error */}
+
             {bookError && (
               <div className="mt-5 px-4 py-3 rounded-lg bg-red-50 border border-red-100 text-red-700 text-sm">
                 {bookError}
@@ -657,21 +956,23 @@ async function addBookToLibrary() {
             )}
 
             {/* Book Result */}
+
             {bookResult && (
               <div className="mt-8 border-t border-[#0f172a]/10 pt-8">
-
                 <p className="uppercase tracking-[0.2em] text-xs text-[#7a947c] mb-5">
                   Book found
                 </p>
 
                 <div className="flex flex-col sm:flex-row gap-7">
-
                   {/* Book Cover */}
+
                   <div className="w-36 sm:w-40 flex-shrink-0 mx-auto sm:mx-0">
                     <div className="aspect-[2/3] rounded-lg overflow-hidden shadow-md bg-[#e9e4d9]">
                       {bookResult.coverUrl ? (
                         <img
-                          src={bookResult.coverUrl}
+                          src={
+                            bookResult.coverUrl
+                          }
                           alt={`Cover of ${bookResult.title}`}
                           className="w-full h-full object-cover"
                         />
@@ -694,6 +995,7 @@ async function addBookToLibrary() {
                   </div>
 
                   {/* Book Details */}
+
                   <div className="flex-1">
                     <h3 className="text-3xl font-classical font-semibold text-[#0f172a] leading-tight">
                       {bookResult.title}
@@ -706,7 +1008,6 @@ async function addBookToLibrary() {
                     )}
 
                     <div className="mt-6 space-y-3 text-sm">
-
                       {bookResult.isbn13 && (
                         <div className="flex gap-3">
                           <span className="text-slate-400 w-28">
@@ -750,7 +1051,9 @@ async function addBookToLibrary() {
                           </span>
 
                           <span className="text-slate-700">
-                            {bookResult.publishedDate}
+                            {
+                              bookResult.publishedDate
+                            }
                           </span>
                         </div>
                       )}
@@ -783,6 +1086,7 @@ async function addBookToLibrary() {
                 </div>
 
                 {/* Reading Status */}
+
                 <div className="mt-8">
                   <label
                     htmlFor="status"
@@ -814,6 +1118,7 @@ async function addBookToLibrary() {
                 </div>
 
                 {/* Where Bought */}
+
                 <div className="mt-5">
                   <label
                     htmlFor="boughtFrom"
@@ -827,22 +1132,28 @@ async function addBookToLibrary() {
                     type="text"
                     value={boughtFrom}
                     onChange={(event) =>
-                      setBoughtFrom(event.target.value)
+                      setBoughtFrom(
+                        event.target.value
+                      )
                     }
                     placeholder="e.g. Text Book Centre, Amazon, Jumia, Bookstore"
                     className="w-full h-12 px-4 bg-white border border-slate-200 rounded-lg text-slate-700 placeholder:text-slate-400 focus:outline-none focus:border-[#7a947c] focus:ring-1 focus:ring-[#7a947c]/30 transition-all"
                   />
 
                   <p className="text-xs text-slate-400 mt-2">
-                    You can leave this blank if you don&apos;t remember.
+                    You can leave this blank if you
+                    don&apos;t remember.
                   </p>
                 </div>
 
                 {/* Add To Library */}
+
                 <button
                   type="button"
                   onClick={addBookToLibrary}
-                  disabled={addingBook || !userId}
+                  disabled={
+                    addingBook || !userId
+                  }
                   className="w-full mt-6 bg-[#7a947c] text-[#Fdfaf3] py-3.5 rounded-full hover:bg-[#6b826c] disabled:opacity-50 transition-all"
                 >
                   {addingBook
