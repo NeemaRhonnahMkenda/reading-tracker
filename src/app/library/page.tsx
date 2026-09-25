@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { BrowserMultiFormatReader } from "@zxing/browser";
+import { useRouter } from "next/navigation";
 
 import Navbar from "../components/Navbar";
 import { supabase } from "../../lib/supabase";
@@ -32,22 +33,45 @@ interface BookResult {
 }
 
 export default function Library() {
+  // --------------------------------------------------
+  // Router
+  // IMPORTANT: Hooks must be called inside the component
+  // --------------------------------------------------
+
+  const router = useRouter();
+
+  // --------------------------------------------------
+  // Library
+  // --------------------------------------------------
+
   const [books, setBooks] = useState<Book[]>([]);
   const [loading, setLoading] = useState(true);
 
+  // --------------------------------------------------
   // Authentication
+  // --------------------------------------------------
+
   const [userId, setUserId] = useState<string | null>(null);
 
+  // --------------------------------------------------
   // Add book modal
+  // --------------------------------------------------
+
   const [showAddBook, setShowAddBook] = useState(false);
 
+  // --------------------------------------------------
   // ISBN search
+  // --------------------------------------------------
+
   const [isbn, setIsbn] = useState("");
   const [bookResult, setBookResult] = useState<BookResult | null>(null);
   const [searchingBook, setSearchingBook] = useState(false);
   const [bookError, setBookError] = useState("");
 
+  // --------------------------------------------------
   // Barcode scanner
+  // --------------------------------------------------
+
   const [scanning, setScanning] = useState(false);
   const [scannerError, setScannerError] = useState("");
 
@@ -60,42 +84,208 @@ export default function Library() {
 
   const hasScannedRef = useRef(false);
 
+  // --------------------------------------------------
   // Book status
+  // --------------------------------------------------
+
   const [status, setStatus] = useState("want_to_read");
 
+  // --------------------------------------------------
   // Where bought
+  // --------------------------------------------------
+
   const [boughtFrom, setBoughtFrom] = useState("");
 
+  // --------------------------------------------------
   // Add book loading state
+  // --------------------------------------------------
+
   const [addingBook, setAddingBook] = useState(false);
 
+  // --------------------------------------------------
   // Library search/filter
+  // --------------------------------------------------
+
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("all");
+
+  // --------------------------------------------------
+  // Fetch books for a specific user
+  // --------------------------------------------------
+
+  async function fetchBooksForUser(currentUserId: string) {
+    if (!currentUserId) {
+      setBooks([]);
+      return;
+    }
+
+    try {
+      const { data, error } = await supabase
+        .from("books")
+        .select("*")
+        .eq("user_id", currentUserId)
+        .order("created_at", { ascending: false });
+
+      if (error) {
+        console.error("Error fetching your books:", error);
+        setBooks([]);
+        return;
+      }
+
+      setBooks(data || []);
+    } catch (error) {
+      console.error("Unexpected error fetching books:", error);
+      setBooks([]);
+    }
+  }
 
   // --------------------------------------------------
   // Get authenticated user
   // --------------------------------------------------
 
+  async function getCurrentUser() {
+    setLoading(true);
+
+    try {
+      const {
+        data: { session },
+        error,
+      } = await supabase.auth.getSession();
+
+      if (error) {
+        console.error("Error getting Supabase session:", error);
+
+        setUserId(null);
+        setBooks([]);
+        setLoading(false);
+
+        return;
+      }
+
+      if (!session?.user) {
+        console.log("No authenticated Supabase session found.");
+
+        setUserId(null);
+        setBooks([]);
+        setLoading(false);
+
+        return;
+      }
+
+      const currentUserId = session.user.id;
+
+      console.log("Authenticated user:", session.user);
+      console.log("Authenticated user ID:", currentUserId);
+
+      // Update the state
+      setUserId(currentUserId);
+
+      // IMPORTANT:
+      // Do NOT immediately call fetchBooks() here because
+      // setUserId() is asynchronous.
+      //
+      // Instead, use the ID directly from the session.
+      await fetchBooksForUser(currentUserId);
+    } catch (error) {
+      console.error("Unexpected authentication error:", error);
+
+      setUserId(null);
+      setBooks([]);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // --------------------------------------------------
+  // Authentication listener
+  // --------------------------------------------------
+
   useEffect(() => {
-    getCurrentUser();
+    let mounted = true;
+
+    async function initializeAuth() {
+      if (!mounted) return;
+
+      await getCurrentUser();
+    }
+
+    initializeAuth();
 
     const {
       data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
+    } = supabase.auth.onAuthStateChange(async (_event, session) => {
+      if (!mounted) return;
+
       if (session?.user) {
-        setUserId(session.user.id);
-        fetchBooks();
+        const currentUserId = session.user.id;
+
+        console.log(
+          "Auth state changed. Current user:",
+          currentUserId
+        );
+
+        setUserId(currentUserId);
+        setLoading(true);
+
+        await fetchBooksForUser(currentUserId);
+
+        if (mounted) {
+          setLoading(false);
+        }
       } else {
+        console.log("User signed out.");
+
         setUserId(null);
         setBooks([]);
+        setLoading(false);
       }
     });
 
     return () => {
+      mounted = false;
       subscription.unsubscribe();
     };
   }, []);
+
+  // --------------------------------------------------
+  // Stop barcode scanner
+  // --------------------------------------------------
+
+  function stopBarcodeScanner() {
+    // Stop ZXing's barcode decoding
+    if (scannerControlsRef.current) {
+      try {
+        scannerControlsRef.current.stop();
+      } catch (error) {
+        console.error("Error stopping scanner:", error);
+      }
+
+      scannerControlsRef.current = null;
+    }
+
+    // Stop the camera stream
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => {
+        track.stop();
+      });
+
+      streamRef.current = null;
+    }
+
+    // Clear the video element
+    if (videoRef.current) {
+      try {
+        videoRef.current.pause();
+      } catch {
+        // Ignore pause errors during cleanup
+      }
+
+      videoRef.current.srcObject = null;
+    }
+
+    hasScannedRef.current = false;
+    setScanning(false);
+  }
 
   // --------------------------------------------------
   // Clean up barcode scanner when page closes
@@ -104,74 +294,34 @@ export default function Library() {
   useEffect(() => {
     return () => {
       if (scannerControlsRef.current) {
-        scannerControlsRef.current.stop();
+        try {
+          scannerControlsRef.current.stop();
+        } catch {
+          // Ignore cleanup errors
+        }
+
         scannerControlsRef.current = null;
       }
 
       if (streamRef.current) {
-        streamRef.current
-          .getTracks()
-          .forEach((track) => track.stop());
+        streamRef.current.getTracks().forEach((track) => {
+          track.stop();
+        });
 
         streamRef.current = null;
       }
 
       if (videoRef.current) {
-        videoRef.current.pause();
+        try {
+          videoRef.current.pause();
+        } catch {
+          // Ignore cleanup errors
+        }
+
         videoRef.current.srcObject = null;
       }
     };
   }, []);
-
-  async function getCurrentUser() {
-    setLoading(true);
-
-    const {
-      data: { session },
-      error,
-    } = await supabase.auth.getSession();
-
-    if (error) {
-      console.error("Error getting Supabase session:", error);
-      setUserId(null);
-      setLoading(false);
-      return;
-    }
-
-    if (!session?.user) {
-      console.error("No authenticated Supabase session found.");
-      setUserId(null);
-      setBooks([]);
-      setLoading(false);
-      return;
-    }
-
-    console.log("Authenticated user:", session.user);
-    console.log("Authenticated user ID:", session.user.id);
-
-    setUserId(session.user.id);
-
-    await fetchBooks();
-
-    setLoading(false);
-  }
-
-  // --------------------------------------------------
-  // Fetch books from Supabase
-  // --------------------------------------------------
-
-  async function fetchBooks() {
-    const { data, error } = await supabase
-      .from("books")
-      .select("*")
-      .order("created_at", { ascending: false });
-
-    if (error) {
-      console.error("Error fetching books:", error);
-    } else {
-      setBooks(data || []);
-    }
-  }
 
   // --------------------------------------------------
   // Search for book by ISBN
@@ -192,6 +342,7 @@ export default function Library() {
 
     setSearchingBook(true);
     setBookError("");
+    setScannerError("");
     setBookResult(null);
 
     try {
@@ -232,10 +383,23 @@ export default function Library() {
     setScannerError("");
     setBookError("");
     setScanning(true);
-
     hasScannedRef.current = false;
 
     try {
+      // Check that the browser supports media devices
+      if (
+        typeof navigator === "undefined" ||
+        !navigator.mediaDevices ||
+        !navigator.mediaDevices.getUserMedia
+      ) {
+        setScannerError(
+          "Camera access is not supported by this browser. Please enter the ISBN manually."
+        );
+
+        setScanning(false);
+        return;
+      }
+
       const devices =
         await BrowserMultiFormatReader.listVideoInputDevices();
 
@@ -248,84 +412,129 @@ export default function Library() {
         return;
       }
 
+      // Prefer the back camera on phones
       const backCamera =
-        devices.find((device) =>
-          device.label.toLowerCase().includes("back")
-        ) || devices[0];
+        devices.find((device) => {
+          const label = device.label.toLowerCase();
+
+          return (
+            label.includes("back") ||
+            label.includes("rear") ||
+            label.includes("environment")
+          );
+        }) || devices[0];
 
       const codeReader = new BrowserMultiFormatReader();
 
-      const controls = await codeReader.decodeFromVideoDevice(
-        backCamera.deviceId,
-        videoRef.current!,
-        async (result) => {
-          if (!result) {
-            return;
-          }
+      if (!videoRef.current) {
+        setScannerError(
+          "The camera could not be initialized. Please try again."
+        );
 
-          // Prevent multiple searches from the same barcode
-          if (hasScannedRef.current) {
-            return;
-          }
+        setScanning(false);
+        return;
+      }
 
-          const scannedValue = result.getText();
+      const controls =
+        await codeReader.decodeFromVideoDevice(
+          backCamera.deviceId,
+          videoRef.current,
+          async (result) => {
+            if (!result) {
+              return;
+            }
 
-          console.log("Scanned barcode:", scannedValue);
+            // Prevent multiple searches from the same barcode
+            if (hasScannedRef.current) {
+              return;
+            }
 
-          const cleanBarcode = scannedValue.replace(
-            /[-\s]/g,
-            ""
-          );
+            const scannedValue = result.getText();
 
-          // Ignore barcodes that are not valid ISBNs
-          if (
-            !/^(?:\d{10}|\d{13})$/.test(cleanBarcode)
-          ) {
-            setScannerError(
-              "The scanned barcode does not look like a valid ISBN. Please try again."
+            console.log(
+              "Scanned barcode:",
+              scannedValue
             );
 
-            return;
+            const cleanBarcode = scannedValue.replace(
+              /[-\s]/g,
+              ""
+            );
+
+            // Ignore barcodes that are not valid ISBNs
+            if (
+              !/^(?:\d{10}|\d{13})$/.test(cleanBarcode)
+            ) {
+              setScannerError(
+                "The scanned barcode does not look like a valid ISBN. Please try again."
+              );
+
+              return;
+            }
+
+            // Mark as scanned BEFORE doing anything else
+            hasScannedRef.current = true;
+
+            console.log(
+              "Detected ISBN:",
+              cleanBarcode
+            );
+
+            // Stop ZXing's continuous decoding
+            if (scannerControlsRef.current) {
+              try {
+                scannerControlsRef.current.stop();
+              } catch {
+                // Ignore scanner stop errors
+              }
+
+              scannerControlsRef.current = null;
+            }
+
+            // Stop the camera
+            if (streamRef.current) {
+              streamRef.current
+                .getTracks()
+                .forEach((track) => track.stop());
+
+              streamRef.current = null;
+            }
+
+            if (videoRef.current) {
+              try {
+                videoRef.current.pause();
+              } catch {
+                // Ignore pause errors
+              }
+
+              videoRef.current.srcObject = null;
+            }
+
+            setScanning(false);
+
+            // Put the ISBN into the input
+            setIsbn(cleanBarcode);
+
+            // Search only ONCE
+            await searchBookByISBN(cleanBarcode);
           }
-
-          // Mark as scanned BEFORE doing anything else
-          hasScannedRef.current = true;
-
-          console.log("Detected ISBN:", cleanBarcode);
-
-          // Stop ZXing's continuous decoding
-          if (scannerControlsRef.current) {
-            scannerControlsRef.current.stop();
-            scannerControlsRef.current = null;
-          }
-
-          // Stop the camera
-          if (streamRef.current) {
-            streamRef.current
-              .getTracks()
-              .forEach((track) => track.stop());
-
-            streamRef.current = null;
-          }
-
-          if (videoRef.current) {
-            videoRef.current.pause();
-            videoRef.current.srcObject = null;
-          }
-
-          setScanning(false);
-
-          // Put the ISBN into the input
-          setIsbn(cleanBarcode);
-
-          // Search only ONCE
-          await searchBookByISBN(cleanBarcode);
-        }
-      );
+        );
 
       scannerControlsRef.current = controls;
+
+      // ZXing manages the video stream internally, so capture
+      // the stream from the video element when available.
+      if (
+        videoRef.current &&
+        videoRef.current.srcObject instanceof MediaStream
+      ) {
+        streamRef.current = videoRef.current.srcObject;
+      }
     } catch (error) {
-      console.error("Barcode scanner error:", error);
+      console.error(
+        "Barcode scanner error:",
+        error
+      );
 
       stopBarcodeScanner();
 
@@ -336,48 +545,21 @@ export default function Library() {
   }
 
   // --------------------------------------------------
-  // Stop barcode scanner
-  // --------------------------------------------------
-
-  function stopBarcodeScanner() {
-    // Stop ZXing's barcode decoding
-    if (scannerControlsRef.current) {
-      scannerControlsRef.current.stop();
-      scannerControlsRef.current = null;
-    }
-
-    // Stop the camera stream
-    if (streamRef.current) {
-      streamRef.current
-        .getTracks()
-        .forEach((track) => track.stop());
-
-      streamRef.current = null;
-    }
-
-    // Clear the video element
-    if (videoRef.current) {
-      videoRef.current.pause();
-      videoRef.current.srcObject = null;
-    }
-
-    hasScannedRef.current = false;
-
-    setScanning(false);
-  }
-
-  // --------------------------------------------------
   // Add book to Supabase
   // --------------------------------------------------
 
   async function addBookToLibrary() {
     if (!bookResult) {
-      setBookError("Please find a book before adding it.");
+      setBookError(
+        "Please find a book before adding it."
+      );
       return;
     }
 
     if (!bookResult.title) {
-      setBookError("This book does not have a title.");
+      setBookError(
+        "This book does not have a title."
+      );
       return;
     }
 
@@ -392,7 +574,10 @@ export default function Library() {
     setBookError("");
 
     try {
-      console.log("Adding book for user:", userId);
+      console.log(
+        "Adding book for user:",
+        userId
+      );
 
       const { data, error } = await supabase
         .from("books")
@@ -404,15 +589,18 @@ export default function Library() {
             isbn_10: bookResult.isbn10,
             isbn_13: bookResult.isbn13,
             binding: bookResult.binding,
-            published_date: formatPublishedDate(
-              bookResult.publishedDate
-            ),
+            published_date:
+              formatPublishedDate(
+                bookResult.publishedDate
+              ),
             publisher: bookResult.publisher,
             pages: bookResult.pages,
             cover_url: bookResult.coverUrl,
-            open_library_id: bookResult.openLibraryId,
+            open_library_id:
+              bookResult.openLibraryId,
             status: status,
-            bought_from: boughtFrom || null,
+            bought_from:
+              boughtFrom.trim() || null,
             added_at: new Date().toISOString(),
           },
         ])
@@ -420,7 +608,10 @@ export default function Library() {
         .single();
 
       if (error) {
-        console.error("Error adding book:", error);
+        console.error(
+          "Error adding book:",
+          error
+        );
 
         setBookError(
           `Could not add the book: ${error.message}`
@@ -429,11 +620,14 @@ export default function Library() {
         return;
       }
 
-      console.log("Book successfully added:", data);
+      console.log(
+        "Book successfully added:",
+        data
+      );
 
       if (data) {
         setBooks((currentBooks) => [
-          data,
+          data as Book,
           ...currentBooks,
         ]);
       }
@@ -464,13 +658,25 @@ export default function Library() {
       return null;
     }
 
+    // Handle year-only dates such as "2024"
+    if (/^\d{4}$/.test(date)) {
+      return `${date}-01-01`;
+    }
+
+    // Handle year-month dates such as "2024-05"
+    if (/^\d{4}-\d{2}$/.test(date)) {
+      return `${date}-01`;
+    }
+
     const parsedDate = new Date(date);
 
     if (Number.isNaN(parsedDate.getTime())) {
       return null;
     }
 
-    return parsedDate.toISOString().split("T")[0];
+    return parsedDate
+      .toISOString()
+      .split("T")[0];
   }
 
   // --------------------------------------------------
@@ -495,9 +701,12 @@ export default function Library() {
   // --------------------------------------------------
 
   const filteredBooks = books.filter((book) => {
-    const searchTerm = search.toLowerCase();
+    const searchTerm = search
+      .trim()
+      .toLowerCase();
 
     const matchesSearch =
+      !searchTerm ||
       book.title
         .toLowerCase()
         .includes(searchTerm) ||
@@ -516,8 +725,10 @@ export default function Library() {
   // Convert status value to readable label
   // --------------------------------------------------
 
-  function statusLabel(status: string | null) {
-    switch (status) {
+  function statusLabel(
+    bookStatus: string | null
+  ) {
+    switch (bookStatus) {
       case "reading":
         return "Currently Reading";
 
@@ -531,6 +742,10 @@ export default function Library() {
         return "Want to Read";
     }
   }
+
+  // --------------------------------------------------
+  // Render
+  // --------------------------------------------------
 
   return (
     <main className="min-h-screen bg-[#Fdfaf3] text-slate-800 font-sans selection:bg-[#d8d0e3] selection:text-[#0f172a] relative overflow-hidden">
@@ -572,18 +787,24 @@ export default function Library() {
             </h1>
 
             <p className="mt-4 text-slate-600 font-light max-w-xl text-lg">
-              A home for the books you&apos;ve read,
-              are reading, and hope to read.
+              A home for the books you&apos;ve
+              read, are reading, and hope to
+              read.
             </p>
           </div>
 
           <button
             type="button"
-            onClick={() => setShowAddBook(true)}
+            onClick={() =>
+              setShowAddBook(true)
+            }
             disabled={!userId}
             className="w-fit bg-[#0f172a] text-[#Fdfaf3] px-7 py-3.5 rounded-full flex items-center gap-3 shadow-md hover:shadow-lg hover:-translate-y-0.5 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            <span className="text-xl">+</span>
+            <span className="text-xl">
+              +
+            </span>
+
             <span>Add Book</span>
           </button>
         </div>
@@ -610,7 +831,8 @@ export default function Library() {
               {
                 books.filter(
                   (book) =>
-                    book.status === "reading"
+                    book.status ===
+                    "reading"
                 ).length
               }
             </p>
@@ -625,7 +847,8 @@ export default function Library() {
               {
                 books.filter(
                   (book) =>
-                    book.status === "finished"
+                    book.status ===
+                    "finished"
                 ).length
               }
             </p>
@@ -672,10 +895,11 @@ export default function Library() {
                 onClick={() =>
                   setFilter(item.value)
                 }
-                className={`px-5 py-2.5 rounded-full text-sm transition-all ${filter === item.value
-                  ? "bg-[#0f172a] text-[#Fdfaf3]"
-                  : "bg-white text-slate-600 border border-slate-200 hover:border-[#7a947c] hover:text-[#7a947c]"
-                  }`}
+                className={`px-5 py-2.5 rounded-full text-sm transition-all ${
+                  filter === item.value
+                    ? "bg-[#0f172a] text-[#Fdfaf3]"
+                    : "bg-white text-slate-600 border border-slate-200 hover:border-[#7a947c] hover:text-[#7a947c]"
+                }`}
               >
                 {item.label}
               </button>
@@ -698,31 +922,41 @@ export default function Library() {
             </div>
 
             <h2 className="text-3xl font-classical text-[#0f172a]">
-              Your shelves are waiting.
+              {books.length > 0
+                ? "No books found."
+                : "Your shelves are waiting."}
             </h2>
 
             <p className="text-slate-500 font-light mt-3 max-w-md mx-auto">
-              Add your first book to begin building
-              your personal archive.
+              {books.length > 0
+                ? "Try changing your search or filter."
+                : "Add your first book to begin building your personal archive."}
             </p>
 
-            <button
-              type="button"
-              onClick={() =>
-                setShowAddBook(true)
-              }
-              disabled={!userId}
-              className="mt-7 bg-[#7a947c] text-[#Fdfaf3] px-7 py-3 rounded-full hover:bg-[#6b826c] disabled:opacity-50 disabled:cursor-not-allowed transition-all"
-            >
-              Add Your First Book
-            </button>
+            {books.length === 0 && (
+              <button
+                type="button"
+                onClick={() =>
+                  setShowAddBook(true)
+                }
+                disabled={!userId}
+                className="mt-7 bg-[#7a947c] text-[#Fdfaf3] px-7 py-3 rounded-full hover:bg-[#6b826c] disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+              >
+                Add Your First Book
+              </button>
+            )}
           </div>
         ) : (
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-7">
             {filteredBooks.map((book) => (
               <article
                 key={book.id}
-                className="group"
+                onClick={() =>
+                  router.push(
+                    `/library/${book.id}`
+                  )
+                }
+                className="group cursor-pointer"
               >
                 {/* Book Cover */}
 
@@ -732,6 +966,11 @@ export default function Library() {
                       src={book.cover_url}
                       alt={`Cover of ${book.title}`}
                       className="w-full h-full object-cover"
+                      loading="lazy"
+                      onError={(event) => {
+                        event.currentTarget.style.display =
+                          "none";
+                      }}
                     />
                   ) : (
                     <div className="w-full h-full p-6 flex flex-col justify-between bg-[#0f172a] text-[#Fdfaf3]">
@@ -772,7 +1011,9 @@ export default function Library() {
                   )}
 
                   <span className="inline-block mt-3 text-xs px-3 py-1 rounded-full bg-[#d8d0e3]/50 text-[#0f172a]">
-                    {statusLabel(book.status)}
+                    {statusLabel(
+                      book.status
+                    )}
                   </span>
                 </div>
               </article>
@@ -809,8 +1050,8 @@ export default function Library() {
                 </h2>
 
                 <p className="text-slate-500 font-light mt-2">
-                  Enter an ISBN or scan the barcode
-                  on your book.
+                  Enter an ISBN or scan the
+                  barcode on your book.
                 </p>
               </div>
 
@@ -818,6 +1059,7 @@ export default function Library() {
                 type="button"
                 onClick={closeAddBookModal}
                 className="text-slate-400 hover:text-[#0f172a] text-2xl transition-colors"
+                aria-label="Close"
               >
                 ×
               </button>
@@ -839,12 +1081,16 @@ export default function Library() {
                   type="text"
                   value={isbn}
                   onChange={(event) => {
-                    setIsbn(event.target.value);
+                    setIsbn(
+                      event.target.value
+                    );
                     setBookError("");
                     setScannerError("");
                   }}
                   onKeyDown={(event) => {
-                    if (event.key === "Enter") {
+                    if (
+                      event.key === "Enter"
+                    ) {
                       event.preventDefault();
                       searchBook();
                     }
@@ -857,7 +1103,8 @@ export default function Library() {
                   type="button"
                   onClick={searchBook}
                   disabled={
-                    searchingBook || scanning
+                    searchingBook ||
+                    scanning
                   }
                   className="h-12 px-6 bg-[#0f172a] text-[#Fdfaf3] rounded-lg hover:bg-[#1b2940] disabled:opacity-50 transition-all"
                 >
@@ -884,7 +1131,9 @@ export default function Library() {
               {!scanning ? (
                 <button
                   type="button"
-                  onClick={startBarcodeScanner}
+                  onClick={
+                    startBarcodeScanner
+                  }
                   disabled={searchingBook}
                   className="w-full h-12 border border-[#7a947c] text-[#7a947c] rounded-lg hover:bg-[#7a947c] hover:text-[#Fdfaf3] disabled:opacity-50 transition-all flex items-center justify-center gap-2"
                 >
@@ -916,15 +1165,17 @@ export default function Library() {
 
                     <div className="absolute bottom-3 left-0 right-0 text-center">
                       <span className="inline-block bg-[#0f172a]/80 text-white text-xs px-4 py-2 rounded-full">
-                        Point your camera at the
-                        book barcode
+                        Point your camera at
+                        the book barcode
                       </span>
                     </div>
                   </div>
 
                   <button
                     type="button"
-                    onClick={stopBarcodeScanner}
+                    onClick={
+                      stopBarcodeScanner
+                    }
                     className="w-full h-11 border border-slate-200 text-slate-600 rounded-lg hover:border-[#0f172a] hover:text-[#0f172a] transition-all"
                   >
                     Cancel Scan
@@ -933,9 +1184,9 @@ export default function Library() {
               )}
 
               <p className="text-xs text-slate-400">
-                Enter an ISBN-10 or ISBN-13 manually,
-                or scan the barcode on the back of
-                your book.
+                Enter an ISBN-10 or ISBN-13
+                manually, or scan the barcode
+                on the back of your book.
               </p>
 
               {/* Scanner Error */}
@@ -983,7 +1234,9 @@ export default function Library() {
                           </span>
 
                           <span className="font-classical text-lg leading-tight">
-                            {bookResult.title}
+                            {
+                              bookResult.title
+                            }
                           </span>
 
                           <span className="font-classical text-xl opacity-50">
@@ -1003,7 +1256,9 @@ export default function Library() {
 
                     {bookResult.author && (
                       <p className="text-lg text-slate-600 mt-2">
-                        {bookResult.author}
+                        {
+                          bookResult.author
+                        }
                       </p>
                     )}
 
@@ -1015,7 +1270,9 @@ export default function Library() {
                           </span>
 
                           <span className="text-slate-700">
-                            {bookResult.isbn13}
+                            {
+                              bookResult.isbn13
+                            }
                           </span>
                         </div>
                       )}
@@ -1027,7 +1284,9 @@ export default function Library() {
                           </span>
 
                           <span className="text-slate-700">
-                            {bookResult.isbn10}
+                            {
+                              bookResult.isbn10
+                            }
                           </span>
                         </div>
                       )}
@@ -1039,7 +1298,9 @@ export default function Library() {
                           </span>
 
                           <span className="text-slate-700">
-                            {bookResult.binding}
+                            {
+                              bookResult.binding
+                            }
                           </span>
                         </div>
                       )}
@@ -1065,7 +1326,9 @@ export default function Library() {
                           </span>
 
                           <span className="text-slate-700">
-                            {bookResult.publisher}
+                            {
+                              bookResult.publisher
+                            }
                           </span>
                         </div>
                       )}
@@ -1077,7 +1340,9 @@ export default function Library() {
                           </span>
 
                           <span className="text-slate-700">
-                            {bookResult.pages}
+                            {
+                              bookResult.pages
+                            }
                           </span>
                         </div>
                       )}
@@ -1099,7 +1364,9 @@ export default function Library() {
                     id="status"
                     value={status}
                     onChange={(event) =>
-                      setStatus(event.target.value)
+                      setStatus(
+                        event.target.value
+                      )
                     }
                     className="w-full h-12 px-4 bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-[#7a947c] focus:ring-1 focus:ring-[#7a947c]/30"
                   >
@@ -1124,7 +1391,8 @@ export default function Library() {
                     htmlFor="boughtFrom"
                     className="block text-sm font-medium text-slate-700 mb-2"
                   >
-                    Where did you buy this book?
+                    Where did you buy this
+                    book?
                   </label>
 
                   <input
@@ -1141,8 +1409,9 @@ export default function Library() {
                   />
 
                   <p className="text-xs text-slate-400 mt-2">
-                    You can leave this blank if you
-                    don&apos;t remember.
+                    You can leave this blank
+                    if you don&apos;t
+                    remember.
                   </p>
                 </div>
 
@@ -1150,7 +1419,9 @@ export default function Library() {
 
                 <button
                   type="button"
-                  onClick={addBookToLibrary}
+                  onClick={
+                    addBookToLibrary
+                  }
                   disabled={
                     addingBook || !userId
                   }

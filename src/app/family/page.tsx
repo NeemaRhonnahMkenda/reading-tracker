@@ -153,13 +153,6 @@ export default function FamilyPage() {
                 return;
             }
 
-            // --------------------------------------------------------
-            // Get family
-            //
-            // At this point the user is already a member, so the
-            // families SELECT policy should allow this query.
-            // --------------------------------------------------------
-
             const {
                 data: familyData,
                 error: familyError,
@@ -333,13 +326,6 @@ export default function FamilyPage() {
         setSuccess("");
 
         try {
-            // --------------------------------------------------------
-            // Get the authenticated user directly from Supabase.
-            //
-            // We do not rely on the userId React state here because
-            // the state may not have finished updating yet.
-            // --------------------------------------------------------
-
             const {
                 data: { user },
                 error: userError,
@@ -372,26 +358,7 @@ export default function FamilyPage() {
 
             setUserId(currentUserId);
 
-            // --------------------------------------------------------
-            // Generate the family ID ourselves.
-            //
-            // This is the important fix.
-            //
-            // We now know the family ID before inserting the family,
-            // so we don't need to INSERT -> SELECT -> INSERT.
-            // --------------------------------------------------------
-
             const newFamilyId = crypto.randomUUID();
-
-            // --------------------------------------------------------
-            // Create the family
-            //
-            // IMPORTANT:
-            // Do NOT use .select() here.
-            //
-            // The families SELECT policy requires the user to be a
-            // family member. The creator isn't a member yet.
-            // --------------------------------------------------------
 
             const { error: familyError } = await supabase
                 .from("families")
@@ -424,13 +391,6 @@ export default function FamilyPage() {
                 return;
             }
 
-            // --------------------------------------------------------
-            // Add creator as the first family member
-            //
-            // This must happen before loadFamily(), because the
-            // families SELECT policy uses is_family_member(id).
-            // --------------------------------------------------------
-
             const { error: memberError } = await supabase
                 .from("family_members")
                 .insert({
@@ -452,13 +412,6 @@ export default function FamilyPage() {
                         2
                     )
                 );
-
-                // ----------------------------------------------------
-                // The family was created but the creator could not be
-                // added as a member.
-                //
-                // Try to clean up the incomplete family.
-                // ----------------------------------------------------
 
                 const { error: cleanupError } = await supabase
                     .from("families")
@@ -490,11 +443,6 @@ export default function FamilyPage() {
             setSuccess(
                 "Your family has been created successfully."
             );
-
-            // --------------------------------------------------------
-            // Now the creator is a family member, so loadFamily()
-            // can successfully pass the families SELECT policy.
-            // --------------------------------------------------------
 
             await loadFamily();
         } catch (error) {
