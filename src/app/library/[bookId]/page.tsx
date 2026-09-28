@@ -1,1628 +1,1797 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+// src/app/library/[bookId]/page.tsx
+
+import { FormEvent, KeyboardEvent as ReactKeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Navbar from "../../components/Navbar";
 import { supabase } from "../../../lib/supabase";
 
+// ============================================================
+// Types
+// ============================================================
+
 interface Book {
-    id: string;
-    user_id: string;
-    title: string;
-    author: string | null;
-    cover_url: string | null;
-    custom_cover_path: string | null;
-    status: string | null;
+  id: string;
+  user_id: string;
+  title: string;
+  author: string | null;
+  cover_url: string | null;
+  custom_cover_path: string | null;
+  status: string | null;
 }
 
 interface Review {
-    id: string;
-    rating: number | null;
-    review_text: string | null;
-    created_at: string;
-    updated_at: string;
+  id: string;
+  rating: number | null;
+  review_text: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 interface JournalEntry {
-    id: string;
-    entry_date: string;
-    content: string;
-    created_at: string;
-    updated_at: string;
+  id: string;
+  entry_date: string;
+  content: string;
+  chapter: string | null;
+  page_number: number | null;
+  created_at: string;
+  updated_at: string;
 }
 
 type Tab = "journal" | "review";
+type SortMode = "recent" | "page";
 
 type Toast = {
-    type: "success" | "error";
-    message: string;
+  type: "success" | "error";
+  message: string;
 } | null;
 
-// --------------------------------------------------
+// ============================================================
 // Cover storage config (keep in sync with the library page)
-// --------------------------------------------------
+// ============================================================
 
-const COVER_BUCKET =
-    process.env.NEXT_PUBLIC_SUPABASE_COVER_BUCKET || "book-covers";
+const COVER_BUCKET = process.env.NEXT_PUBLIC_SUPABASE_COVER_BUCKET || "book-covers";
 const MAX_COVER_BYTES = 5 * 1024 * 1024; // 5 MB
 const SIGNED_URL_TTL = 60 * 60; // 1 hour
 
 const ALLOWED_COVER_TYPES: Record<string, string> = {
-    "image/jpeg": "jpg",
-    "image/png": "png",
-    "image/webp": "webp",
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
 };
 
 // Check real file type from magic bytes instead of trusting file.type
 async function sniffImageType(file: File): Promise<string | null> {
-    const bytes = new Uint8Array(await file.slice(0, 12).arrayBuffer());
+  const bytes = new Uint8Array(await file.slice(0, 12).arrayBuffer());
 
-    if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
-    if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
-        return "image/png";
-    }
-    const ascii = String.fromCharCode(...bytes);
-    if (ascii.startsWith("RIFF") && ascii.slice(8, 12) === "WEBP") return "image/webp";
-    return null;
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+    return "image/png";
+  }
+  const ascii = String.fromCharCode(...bytes);
+  if (ascii.startsWith("RIFF") && ascii.slice(8, 12) === "WEBP") return "image/webp";
+  return null;
 }
 
-// --------------------------------------------------
-// Shared helpers (module scope: created once, not per render)
-// --------------------------------------------------
+// ============================================================
+// Shared helpers
+// ============================================================
 
-const DATE_FORMATS: Record<
-    "long" | "short" | "month" | "day",
-    Intl.DateTimeFormatOptions
-> = {
-    long: { weekday: "long", month: "long", day: "numeric", year: "numeric" },
-    short: { month: "short", day: "numeric" },
-    month: { month: "short" },
-    day: { day: "numeric" },
+const DATE_FORMATS: Record<"long" | "short" | "month" | "day", Intl.DateTimeFormatOptions> = {
+  long: { weekday: "long", month: "long", day: "numeric", year: "numeric" },
+  short: { month: "short", day: "numeric", year: "numeric" },
+  month: { month: "short" },
+  day: { day: "numeric" },
 };
 
-function formatEntryDate(
-    date: string,
-    style: "long" | "short" | "month" | "day" = "long"
-) {
-    return new Date(`${date}T00:00:00`).toLocaleDateString(
-        "en-US",
-        DATE_FORMATS[style]
-    );
+function formatEntryDate(date: string, style: "long" | "short" | "month" | "day" = "long") {
+  return new Date(`${date}T00:00:00`).toLocaleDateString("en-GB", DATE_FORMATS[style]);
 }
 
-function sortJournalEntries(entries: JournalEntry[]) {
-    return [...entries].sort((a, b) => {
-        const dateDiff =
-            new Date(`${b.entry_date}T00:00:00`).getTime() -
-            new Date(`${a.entry_date}T00:00:00`).getTime();
+// Local date (not UTC) so late-evening entries don't land on tomorrow/yesterday
+function todayLocal() {
+  const now = new Date();
+  const offset = now.getTimezoneOffset() * 60000;
+  return new Date(now.getTime() - offset).toISOString().split("T")[0];
+}
 
-        if (dateDiff !== 0) return dateDiff;
+function sortByRecent(entries: JournalEntry[]) {
+  return [...entries].sort((a, b) => {
+    const dateDiff =
+      new Date(`${b.entry_date}T00:00:00`).getTime() - new Date(`${a.entry_date}T00:00:00`).getTime();
+    if (dateDiff !== 0) return dateDiff;
+    return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+  });
+}
 
-        return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
-    });
+const chapterCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+
+// Page ascending; entries without a page go last, ordered by chapter then date
+function sortByPage(entries: JournalEntry[]) {
+  return [...entries].sort((a, b) => {
+    if (a.page_number != null && b.page_number != null && a.page_number !== b.page_number) {
+      return a.page_number - b.page_number;
+    }
+    if (a.page_number != null && b.page_number == null) return -1;
+    if (a.page_number == null && b.page_number != null) return 1;
+
+    if (a.chapter && b.chapter) {
+      const byChapter = chapterCollator.compare(a.chapter, b.chapter);
+      if (byChapter !== 0) return byChapter;
+    }
+    if (a.chapter && !b.chapter) return -1;
+    if (!a.chapter && b.chapter) return 1;
+
+    return new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+  });
+}
+
+// "12" -> "Chapter 12"; "Prologue" stays "Prologue"
+function chapterLabel(chapter: string) {
+  return /^\d+$/.test(chapter.trim()) ? `Chapter ${chapter.trim()}` : chapter.trim();
+}
+
+function locationLabel(chapter: string | null, page: number | null) {
+  const parts: string[] = [];
+  if (chapter) parts.push(chapterLabel(chapter));
+  if (page != null) parts.push(`Page ${page}`);
+  return parts.join(" · ");
+}
+
+// Returns a number, null (empty), or "invalid"
+function parsePage(value: string): number | null | "invalid" {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const n = Number(trimmed);
+  if (!Number.isInteger(n) || n < 1 || n > 100000) return "invalid";
+  return n;
 }
 
 const STATUS_LABEL: Record<string, string> = {
-    reading: "Currently Reading",
-    finished: "Finished",
-    want_to_read: "Want to Read",
-};
-
-const STATUS_DESCRIPTION: Record<string, string> = {
-    reading: "You're currently reading this book.",
-    finished: "You've finished reading this book.",
-    want_to_read: "This book is waiting on your shelf.",
+  reading: "Currently reading",
+  finished: "Finished",
+  want_to_read: "Want to read",
 };
 
 const RATING_LABEL: Record<number, string> = {
-    1: "It wasn't for me",
-    2: "It was okay",
-    3: "I liked it",
-    4: "I really liked it",
-    5: "A new favourite",
+  1: "It wasn't for me",
+  2: "It was okay",
+  3: "I liked it",
+  4: "I really liked it",
+  5: "A new favourite",
 };
 
-// --------------------------------------------------
+const focusRing =
+  "outline-none focus-visible:ring-2 focus-visible:ring-[#7a947c] focus-visible:ring-offset-2 focus-visible:ring-offset-[#fdfaf3]";
+
+const fieldClass =
+  "w-full h-11 px-3.5 bg-white border border-[#0f172a]/10 rounded-xl text-sm text-slate-700 placeholder:text-slate-300 focus:outline-none focus:border-[#7a947c] focus:ring-4 focus:ring-[#7a947c]/10 transition-all";
+
+
+// ============================================================
 // Cover image: tries each source in order, then shows the placeholder
-// --------------------------------------------------
+// ============================================================
 
-function CoverImage({
-    sources,
-    title,
-    author,
-}: {
-    sources: string[];
-    title: string;
-    author: string | null;
-}) {
-    const [index, setIndex] = useState(0);
-    const key = sources.join("|");
+function CoverImage({ sources, title, author }: { sources: string[]; title: string; author: string | null }) {
+  const [index, setIndex] = useState(0);
+  const key = sources.join("|");
 
-    useEffect(() => {
-        setIndex(0);
-    }, [key]);
+  useEffect(() => {
+    setIndex(0);
+  }, [key]);
 
-    const src = sources[index];
+  const src = sources[index];
 
-    if (src) {
-        return (
-            <img
-                src={src}
-                alt={`Cover of ${title}`}
-                onError={() => setIndex((i) => i + 1)}
-                className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-[1.025]"
-            />
-        );
-    }
-
+  if (src) {
     return (
-        <div className="w-full h-full bg-[#0f172a] text-[#fdfaf3] p-7 flex flex-col justify-between">
-            <span className="text-[10px] tracking-[0.2em] opacity-50">The Archive</span>
-            <div>
-                <p className="font-classical text-2xl leading-tight">{title}</p>
-                {author && <p className="text-sm opacity-60 mt-3">{author}</p>}
-            </div>
-            <span className="font-classical text-3xl opacity-30">A</span>
-        </div>
+      <img
+        src={src}
+        alt={`Cover of ${title}`}
+        onError={() => setIndex((i) => i + 1)}
+        className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-[1.025]"
+      />
     );
+  }
+
+  return (
+    <div className="w-full h-full bg-[#0f172a] text-[#fdfaf3] p-7 flex flex-col justify-between">
+      <span className="text-[10px] tracking-[0.2em] opacity-50">The Archive</span>
+      <div>
+        <p className="font-classical text-2xl leading-tight">{title}</p>
+        {author && <p className="text-sm opacity-60 mt-3">{author}</p>}
+      </div>
+      <span className="font-classical text-3xl opacity-30">A</span>
+    </div>
+  );
 }
 
+function Spinner() {
+  return <span aria-hidden="true" className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />;
+}
+
+// ============================================================
+// Page
+// ============================================================
+
 export default function BookReviewPage() {
-    const router = useRouter();
-    const params = useParams();
-    const bookId = params.bookId as string;
+  const router = useRouter();
+  const params = useParams();
+  const bookId = params.bookId as string;
 
-    // --------------------------------------------------
-    // Authentication + book data
-    // --------------------------------------------------
+  // Data
+  const [userId, setUserId] = useState<string | null>(null);
+  const [book, setBook] = useState<Book | null>(null);
+  const [review, setReview] = useState<Review | null>(null);
+  const [journalEntries, setJournalEntries] = useState<JournalEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
 
-    const [userId, setUserId] = useState<string | null>(null);
-    const [book, setBook] = useState<Book | null>(null);
-    const [review, setReview] = useState<Review | null>(null);
-    const [journalEntries, setJournalEntries] = useState<JournalEntry[]>([]);
-    const [loading, setLoading] = useState(true);
-    const [error, setError] = useState("");
+  // Custom cover
+  const [customCoverUrl, setCustomCoverUrl] = useState<string | null>(null);
+  const [showCoverModal, setShowCoverModal] = useState(false);
+  const [coverFile, setCoverFile] = useState<File | null>(null);
+  const [coverFileType, setCoverFileType] = useState<string | null>(null);
+  const [coverPreview, setCoverPreview] = useState<string | null>(null);
+  const [coverError, setCoverError] = useState("");
+  const [savingCover, setSavingCover] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  const coverInputRef = useRef<HTMLInputElement | null>(null);
 
-    // --------------------------------------------------
-    // Custom cover
-    // --------------------------------------------------
+  // Tabs
+  const [activeTab, setActiveTab] = useState<Tab>("journal");
 
-    const [customCoverUrl, setCustomCoverUrl] = useState<string | null>(null);
-    const [showCoverModal, setShowCoverModal] = useState(false);
-    const [coverFile, setCoverFile] = useState<File | null>(null);
-    const [coverFileType, setCoverFileType] = useState<string | null>(null);
-    const [coverPreview, setCoverPreview] = useState<string | null>(null);
-    const [coverError, setCoverError] = useState("");
-    const [savingCover, setSavingCover] = useState(false);
-    const [dragOver, setDragOver] = useState(false);
-    const coverInputRef = useRef<HTMLInputElement | null>(null);
+  // Review
+  const [rating, setRating] = useState(0);
+  const [reviewText, setReviewText] = useState("");
+  const [initialRating, setInitialRating] = useState(0);
+  const [initialReviewText, setInitialReviewText] = useState("");
+  const [savingReview, setSavingReview] = useState(false);
+  const [reviewError, setReviewError] = useState("");
+  const [hoveredRating, setHoveredRating] = useState(0);
 
-    // --------------------------------------------------
-    // Tabs
-    // --------------------------------------------------
+  // Journal composer
+  const [journalDate, setJournalDate] = useState(todayLocal());
+  const [journalChapter, setJournalChapter] = useState("");
+  const [journalPage, setJournalPage] = useState("");
+  const [journalText, setJournalText] = useState("");
+  const [savingJournal, setSavingJournal] = useState(false);
+  const [journalError, setJournalError] = useState("");
+  const journalTextRef = useRef<HTMLTextAreaElement | null>(null);
 
-    const [activeTab, setActiveTab] = useState<Tab>("journal");
+  // Journal list
+  const [sortMode, setSortMode] = useState<SortMode>("recent");
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editText, setEditText] = useState("");
+  const [editChapter, setEditChapter] = useState("");
+  const [editPage, setEditPage] = useState("");
+  const [editDate, setEditDate] = useState("");
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [editError, setEditError] = useState("");
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
-    // --------------------------------------------------
-    // Review
-    // --------------------------------------------------
+  // UI
+  const [showLeaveModal, setShowLeaveModal] = useState(false);
+  const [pendingDestination, setPendingDestination] = useState<string | null>(null);
+  const [toast, setToast] = useState<Toast>(null);
 
-    const [rating, setRating] = useState(0);
-    const [reviewText, setReviewText] = useState("");
-    const [initialRating, setInitialRating] = useState(0);
-    const [initialReviewText, setInitialReviewText] = useState("");
-    const [savingReview, setSavingReview] = useState(false);
+  // Keyboard hint: decided after mount so server and client HTML match
+  const [saveShortcut, setSaveShortcut] = useState("Ctrl Enter");
+  useEffect(() => {
+    if (/Mac|iPhone|iPad/.test(navigator.userAgent)) setSaveShortcut("⌘ Enter");
+  }, []);
 
-    // --------------------------------------------------
-    // Journal
-    // --------------------------------------------------
+  // ============================================================
+  // Signed URL for the private custom cover
+  // ============================================================
 
-    const [journalDate, setJournalDate] = useState(
-        new Date().toISOString().split("T")[0]
-    );
-    const [journalText, setJournalText] = useState("");
-    const [savingJournal, setSavingJournal] = useState(false);
-
-    // --------------------------------------------------
-    // UI
-    // --------------------------------------------------
-
-    const [showLeaveModal, setShowLeaveModal] = useState(false);
-    const [pendingDestination, setPendingDestination] = useState<string | null>(
-        null
-    );
-    const [toast, setToast] = useState<Toast>(null);
-    const [hoveredRating, setHoveredRating] = useState(0);
-
-    // --------------------------------------------------
-    // Signed URL for the private custom cover
-    // --------------------------------------------------
-
-    async function signCustomCover(path: string | null) {
-        if (!path) {
-            setCustomCoverUrl(null);
-            return;
-        }
-
-        const { data, error: signError } = await supabase.storage
-            .from(COVER_BUCKET)
-            .createSignedUrl(path, SIGNED_URL_TTL);
-
-        if (signError || !data?.signedUrl) {
-            console.error("Error signing custom cover:", signError?.message);
-            setCustomCoverUrl(null);
-            return;
-        }
-
-        setCustomCoverUrl(data.signedUrl);
+  async function signCustomCover(path: string | null) {
+    if (!path) {
+      setCustomCoverUrl(null);
+      return;
     }
 
-    // --------------------------------------------------
-    // Load page. Book, review and journal entries are fetched in parallel.
-    // --------------------------------------------------
+    const { data, error: signError } = await supabase.storage
+      .from(COVER_BUCKET)
+      .createSignedUrl(path, SIGNED_URL_TTL);
 
-    useEffect(() => {
-        if (!bookId) return;
-        loadPage();
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [bookId]);
-
-    async function loadPage() {
-        setLoading(true);
-        setError("");
-
-        try {
-            const {
-                data: { session },
-                error: sessionError,
-            } = await supabase.auth.getSession();
-
-            if (sessionError || !session?.user) {
-                router.push("/login");
-                return;
-            }
-
-            const currentUserId = session.user.id;
-            setUserId(currentUserId);
-
-            const [bookResult, reviewResult, journalResult] = await Promise.all([
-                supabase
-                    .from("books")
-                    .select("id, user_id, title, author, cover_url, custom_cover_path, status")
-                    .eq("id", bookId)
-                    .eq("user_id", currentUserId)
-                    .single(),
-                supabase
-                    .from("book_reviews")
-                    .select("*")
-                    .eq("book_id", bookId)
-                    .eq("user_id", currentUserId)
-                    .maybeSingle(),
-                supabase
-                    .from("book_journal_entries")
-                    .select("*")
-                    .eq("book_id", bookId)
-                    .eq("user_id", currentUserId)
-                    .order("entry_date", { ascending: false })
-                    .order("created_at", { ascending: false }),
-            ]);
-
-            if (bookResult.error || !bookResult.data) {
-                console.error("Error loading book:", bookResult.error);
-                setError("We couldn't find this book in your library.");
-                return;
-            }
-
-            const loadedBook = bookResult.data as Book;
-            setBook(loadedBook);
-            await signCustomCover(loadedBook.custom_cover_path);
-
-            if (reviewResult.error) {
-                console.error("Error loading review:", reviewResult.error);
-            }
-
-            const savedReview = reviewResult.data;
-            setReview(savedReview);
-            setRating(savedReview?.rating || 0);
-            setReviewText(savedReview?.review_text || "");
-            setInitialRating(savedReview?.rating || 0);
-            setInitialReviewText(savedReview?.review_text || "");
-
-            if (journalResult.error) {
-                console.error("Error loading journal:", journalResult.error);
-            }
-
-            setJournalEntries(journalResult.data || []);
-        } catch (err) {
-            console.error("Unexpected error:", err);
-            setError("Something went wrong while loading this page.");
-        } finally {
-            setLoading(false);
-        }
+    if (signError || !data?.signedUrl) {
+      console.error("Error signing custom cover:", signError?.message);
+      setCustomCoverUrl(null);
+      return;
     }
 
-    // --------------------------------------------------
-    // Cover sources: catalogue URL first, custom cover as fallback
-    // --------------------------------------------------
+    setCustomCoverUrl(data.signedUrl);
+  }
 
-    const coverSources = useMemo(() => {
-        const sources: string[] = [];
-        if (book?.cover_url) sources.push(book.cover_url);
-        if (customCoverUrl) sources.push(customCoverUrl);
-        return sources;
-    }, [book?.cover_url, customCoverUrl]);
+  // ============================================================
+  // Load
+  // ============================================================
 
-    // --------------------------------------------------
-    // Unsaved review changes
-    // --------------------------------------------------
+  useEffect(() => {
+    if (!bookId) return;
+    loadPage();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bookId]);
 
-    const reviewHasChanges = useMemo(() => {
-        return rating !== initialRating || reviewText !== initialReviewText;
-    }, [rating, initialRating, reviewText, initialReviewText]);
+  async function loadPage() {
+    setLoading(true);
+    setLoadError("");
 
-    // --------------------------------------------------
-    // Browser close / refresh warning
-    // --------------------------------------------------
+    try {
+      const {
+        data: { session },
+        error: sessionError,
+      } = await supabase.auth.getSession();
 
-    useEffect(() => {
-        function handleBeforeUnload(event: BeforeUnloadEvent) {
-            if (!reviewHasChanges) return;
+      if (sessionError || !session?.user) {
+        router.push("/login");
+        return;
+      }
 
-            event.preventDefault();
-            event.returnValue = "";
-        }
+      const currentUserId = session.user.id;
+      setUserId(currentUserId);
 
-        window.addEventListener("beforeunload", handleBeforeUnload);
+      const [bookResult, reviewResult, journalResult] = await Promise.all([
+        supabase
+          .from("books")
+          .select("id, user_id, title, author, cover_url, custom_cover_path, status")
+          .eq("id", bookId)
+          .eq("user_id", currentUserId)
+          .single(),
+        supabase.from("book_reviews").select("*").eq("book_id", bookId).eq("user_id", currentUserId).maybeSingle(),
+        supabase
+          .from("book_journal_entries")
+          .select("*")
+          .eq("book_id", bookId)
+          .eq("user_id", currentUserId)
+          .order("entry_date", { ascending: false })
+          .order("created_at", { ascending: false }),
+      ]);
 
-        return () => {
-            window.removeEventListener("beforeunload", handleBeforeUnload);
-        };
-    }, [reviewHasChanges]);
+      if (bookResult.error || !bookResult.data) {
+        console.error("Error loading book:", bookResult.error?.message);
+        setLoadError("We couldn't find this book in your library.");
+        return;
+      }
 
-    // --------------------------------------------------
-    // Toast
-    // --------------------------------------------------
+      const loadedBook = bookResult.data as Book;
+      setBook(loadedBook);
+      await signCustomCover(loadedBook.custom_cover_path);
 
-    useEffect(() => {
-        if (!toast) return;
+      if (reviewResult.error) console.error("Error loading review:", reviewResult.error.message);
 
-        const timer = window.setTimeout(() => setToast(null), 3500);
-        return () => window.clearTimeout(timer);
-    }, [toast]);
+      const savedReview = reviewResult.data as Review | null;
+      setReview(savedReview);
+      setRating(savedReview?.rating || 0);
+      setReviewText(savedReview?.review_text || "");
+      setInitialRating(savedReview?.rating || 0);
+      setInitialReviewText(savedReview?.review_text || "");
 
-    const showToast = useCallback((type: "success" | "error", message: string) => {
-        setToast({ type, message });
-    }, []);
+      if (journalResult.error) console.error("Error loading journal:", journalResult.error.message);
 
-    // --------------------------------------------------
-    // Cover modal: preview cleanup, Escape, scroll lock
-    // --------------------------------------------------
+      const entries = (journalResult.data || []) as JournalEntry[];
+      setJournalEntries(entries);
 
-    useEffect(() => {
-        return () => {
-            if (coverPreview) URL.revokeObjectURL(coverPreview);
-        };
-    }, [coverPreview]);
+      // Pick up where you left off: prefill chapter + page from your latest note
+      const latest = [...entries].sort(
+        (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+      )[0];
+      if (latest) {
+        setJournalChapter(latest.chapter || "");
+        setJournalPage(latest.page_number != null ? String(latest.page_number) : "");
+      }
+    } catch (err) {
+      console.error("Unexpected error:", err);
+      setLoadError("Something went wrong while loading this page.");
+    } finally {
+      setLoading(false);
+    }
+  }
 
-    useEffect(() => {
-        if (!showCoverModal) return;
+  // ============================================================
+  // Derived
+  // ============================================================
 
-        const onKey = (event: KeyboardEvent) => {
-            if (event.key === "Escape" && !savingCover) closeCoverModal();
-        };
+  const coverSources = useMemo(() => {
+    const sources: string[] = [];
+    if (book?.cover_url) sources.push(book.cover_url);
+    if (customCoverUrl) sources.push(customCoverUrl);
+    return sources;
+  }, [book?.cover_url, customCoverUrl]);
 
-        const previousOverflow = document.body.style.overflow;
-        document.body.style.overflow = "hidden";
-        window.addEventListener("keydown", onKey);
+  const reviewHasChanges = rating !== initialRating || reviewText !== initialReviewText;
+  const journalHasDraft = journalText.trim().length > 0;
+  const hasUnsaved = reviewHasChanges || journalHasDraft || editingId !== null;
 
-        return () => {
-            document.body.style.overflow = previousOverflow;
-            window.removeEventListener("keydown", onKey);
-        };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [showCoverModal, savingCover]);
+  const sortedEntries = useMemo(
+    () => (sortMode === "page" ? sortByPage(journalEntries) : sortByRecent(journalEntries)),
+    [journalEntries, sortMode]
+  );
 
-    // --------------------------------------------------
-    // Cover selection
-    // --------------------------------------------------
+  // Furthest page noted, shown as reading progress in the hero
+  const furthestPage = useMemo(() => {
+    const pages = journalEntries.map((e) => e.page_number).filter((p): p is number => p != null);
+    return pages.length ? Math.max(...pages) : null;
+  }, [journalEntries]);
 
-    function resetCoverSelection() {
-        setCoverFile(null);
-        setCoverFileType(null);
-        setCoverPreview(null);
-        setCoverError("");
-        setDragOver(false);
-        if (coverInputRef.current) coverInputRef.current.value = "";
+  const displayRating = hoveredRating || rating;
+
+  const composerPage = parsePage(journalPage);
+  const composerLocation = locationLabel(
+    journalChapter.trim() || null,
+    composerPage === "invalid" ? null : composerPage
+  );
+
+  // ============================================================
+  // Browser close / refresh warning
+  // ============================================================
+
+  useEffect(() => {
+    function handleBeforeUnload(event: BeforeUnloadEvent) {
+      if (!hasUnsaved) return;
+      event.preventDefault();
+      event.returnValue = "";
     }
 
-    function openCoverModal() {
-        resetCoverSelection();
-        setShowCoverModal(true);
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [hasUnsaved]);
+
+  // ============================================================
+  // Toast
+  // ============================================================
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = window.setTimeout(() => setToast(null), 3500);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
+
+  const showToast = useCallback((type: "success" | "error", message: string) => {
+    setToast({ type, message });
+  }, []);
+
+  // ============================================================
+  // Cover modal
+  // ============================================================
+
+  useEffect(() => {
+    return () => {
+      if (coverPreview) URL.revokeObjectURL(coverPreview);
+    };
+  }, [coverPreview]);
+
+  useEffect(() => {
+    if (!showCoverModal) return;
+
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !savingCover) closeCoverModal();
+    };
+
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", onKey);
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", onKey);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showCoverModal, savingCover]);
+
+  function resetCoverSelection() {
+    setCoverFile(null);
+    setCoverFileType(null);
+    setCoverPreview(null);
+    setCoverError("");
+    setDragOver(false);
+    if (coverInputRef.current) coverInputRef.current.value = "";
+  }
+
+  function openCoverModal() {
+    resetCoverSelection();
+    setShowCoverModal(true);
+  }
+
+  function closeCoverModal() {
+    if (savingCover) return;
+    resetCoverSelection();
+    setShowCoverModal(false);
+  }
+
+  async function handleCoverFile(file: File | null | undefined) {
+    setCoverError("");
+    if (!file) return;
+
+    if (file.size > MAX_COVER_BYTES) {
+      setCoverError("That image is over 5 MB. Choose a smaller file.");
+      return;
     }
 
-    function closeCoverModal() {
-        if (savingCover) return;
-        resetCoverSelection();
-        setShowCoverModal(false);
+    const realType = await sniffImageType(file);
+
+    if (!realType || !ALLOWED_COVER_TYPES[realType]) {
+      setCoverError("Use a JPG, PNG or WebP image.");
+      return;
     }
 
-    async function handleCoverFile(file: File | null | undefined) {
-        setCoverError("");
-        if (!file) return;
+    setCoverFile(file);
+    setCoverFileType(realType);
+    setCoverPreview(URL.createObjectURL(file));
+  }
 
-        if (file.size > MAX_COVER_BYTES) {
-            setCoverError("That image is over 5 MB. Choose a smaller file.");
-            return;
-        }
+  async function saveCustomCover() {
+    if (!book || !userId || !coverFile || !coverFileType) return;
 
-        const realType = await sniffImageType(file);
+    setSavingCover(true);
+    setCoverError("");
 
-        if (!realType || !ALLOWED_COVER_TYPES[realType]) {
-            setCoverError("Use a JPG, PNG or WebP image.");
-            return;
-        }
+    const previousPath = book.custom_cover_path;
+    const newPath = `${userId}/${crypto.randomUUID()}.${ALLOWED_COVER_TYPES[coverFileType]}`;
 
-        setCoverFile(file);
-        setCoverFileType(realType);
-        setCoverPreview(URL.createObjectURL(file));
+    try {
+      const { error: uploadError } = await supabase.storage
+        .from(COVER_BUCKET)
+        .upload(newPath, coverFile, { contentType: coverFileType, cacheControl: "3600", upsert: false });
+
+      if (uploadError) {
+        console.error("Cover upload failed:", uploadError.message);
+        setCoverError("The cover didn't upload. Try again.");
+        return;
+      }
+
+      const { data, error: updateError } = await supabase
+        .from("books")
+        .update({ custom_cover_path: newPath })
+        .eq("id", book.id)
+        .eq("user_id", userId)
+        .select("id, user_id, title, author, cover_url, custom_cover_path, status")
+        .single();
+
+      if (updateError || !data) {
+        console.error("Cover update failed:", updateError?.message);
+        await supabase.storage.from(COVER_BUCKET).remove([newPath]);
+        setCoverError("The cover couldn't be saved to this book. Try again.");
+        return;
+      }
+
+      if (previousPath && previousPath !== newPath) {
+        const { error: removeError } = await supabase.storage.from(COVER_BUCKET).remove([previousPath]);
+        if (removeError) console.error("Old cover cleanup failed:", removeError.message);
+      }
+
+      setBook(data as Book);
+      await signCustomCover(newPath);
+
+      resetCoverSelection();
+      setShowCoverModal(false);
+      showToast(
+        "success",
+        book.cover_url ? "Cover photo saved. It shows if the catalogue cover is unavailable." : "Cover photo saved."
+      );
+    } catch (err) {
+      console.error("Unexpected cover save error:", err);
+      await supabase.storage.from(COVER_BUCKET).remove([newPath]);
+      setCoverError("The cover couldn't be saved. Try again.");
+    } finally {
+      setSavingCover(false);
+    }
+  }
+
+  async function removeCustomCover() {
+    if (!book || !userId || !book.custom_cover_path) return;
+    if (!window.confirm("Remove your cover photo from this book?")) return;
+
+    setSavingCover(true);
+    setCoverError("");
+
+    const pathToRemove = book.custom_cover_path;
+
+    try {
+      const { data, error: updateError } = await supabase
+        .from("books")
+        .update({ custom_cover_path: null })
+        .eq("id", book.id)
+        .eq("user_id", userId)
+        .select("id, user_id, title, author, cover_url, custom_cover_path, status")
+        .single();
+
+      if (updateError || !data) {
+        console.error("Cover removal failed:", updateError?.message);
+        setCoverError("The cover photo couldn't be removed. Try again.");
+        return;
+      }
+
+      const { error: removeError } = await supabase.storage.from(COVER_BUCKET).remove([pathToRemove]);
+      if (removeError) console.error("Cover file cleanup failed:", removeError.message);
+
+      setBook(data as Book);
+      setCustomCoverUrl(null);
+
+      resetCoverSelection();
+      setShowCoverModal(false);
+      showToast("success", "Cover photo removed.");
+    } finally {
+      setSavingCover(false);
+    }
+  }
+
+  // ============================================================
+  // Navigation
+  // ============================================================
+
+  const attemptToLeave = useCallback(
+    (destination: string) => {
+      if (hasUnsaved) {
+        setPendingDestination(destination);
+        setShowLeaveModal(true);
+        return;
+      }
+      router.push(destination);
+    },
+    [hasUnsaved, router]
+  );
+
+  function discardAndLeave() {
+    const destination = pendingDestination || "/library";
+    setShowLeaveModal(false);
+    setPendingDestination(null);
+    router.push(destination);
+  }
+
+  function goToComposer() {
+    setActiveTab("journal");
+    requestAnimationFrame(() => {
+      document.getElementById("journal-composer")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      journalTextRef.current?.focus({ preventScroll: true });
+    });
+  }
+
+  function goToReview() {
+    setActiveTab("review");
+    requestAnimationFrame(() => {
+      document.getElementById("panel-review")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }
+
+  // Save with Cmd/Ctrl + Enter
+  function onSaveShortcut(event: ReactKeyboardEvent, save: () => void) {
+    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault();
+      save();
+    }
+  }
+
+  // ============================================================
+  // Save review
+  // ============================================================
+
+  async function saveReview() {
+    if (!userId || !book || savingReview) return;
+    setReviewError("");
+
+    if (rating === 0) {
+      setReviewError("Choose a star rating before saving.");
+      return;
     }
 
-    // --------------------------------------------------
-    // Save custom cover: upload new → update row → remove old file
-    // --------------------------------------------------
-
-    async function saveCustomCover() {
-        if (!book || !userId || !coverFile || !coverFileType) return;
-
-        setSavingCover(true);
-        setCoverError("");
-
-        const previousPath = book.custom_cover_path;
-        const newPath = `${userId}/${crypto.randomUUID()}.${ALLOWED_COVER_TYPES[coverFileType]}`;
-
-        try {
-            const { error: uploadError } = await supabase.storage
-                .from(COVER_BUCKET)
-                .upload(newPath, coverFile, {
-                    contentType: coverFileType,
-                    cacheControl: "3600",
-                    upsert: false,
-                });
-
-            if (uploadError) {
-                console.error("Cover upload failed:", uploadError.message);
-                setCoverError("The cover didn't upload. Try again.");
-                return;
-            }
-
-            const { data, error: updateError } = await supabase
-                .from("books")
-                .update({ custom_cover_path: newPath })
-                .eq("id", book.id)
-                .eq("user_id", userId)
-                .select("id, user_id, title, author, cover_url, custom_cover_path, status")
-                .single();
-
-            if (updateError || !data) {
-                console.error("Cover update failed:", updateError?.message);
-                await supabase.storage.from(COVER_BUCKET).remove([newPath]);
-                setCoverError("The cover couldn't be saved to this book. Try again.");
-                return;
-            }
-
-            // Clean up the file being replaced
-            if (previousPath && previousPath !== newPath) {
-                const { error: removeError } = await supabase.storage
-                    .from(COVER_BUCKET)
-                    .remove([previousPath]);
-                if (removeError) console.error("Old cover cleanup failed:", removeError.message);
-            }
-
-            setBook(data as Book);
-            await signCustomCover(newPath);
-
-            resetCoverSelection();
-            setShowCoverModal(false);
-            showToast(
-                "success",
-                book.cover_url
-                    ? "Cover photo saved. It shows if the catalogue cover is unavailable."
-                    : "Cover photo saved."
-            );
-        } catch (err) {
-            console.error("Unexpected cover save error:", err);
-            await supabase.storage.from(COVER_BUCKET).remove([newPath]);
-            setCoverError("The cover couldn't be saved. Try again.");
-        } finally {
-            setSavingCover(false);
-        }
+    if (!reviewText.trim()) {
+      setReviewError("Write a few words before saving your review.");
+      return;
     }
 
-    // --------------------------------------------------
-    // Remove custom cover
-    // --------------------------------------------------
+    if (!reviewHasChanges) return;
 
-    async function removeCustomCover() {
-        if (!book || !userId || !book.custom_cover_path) return;
+    setSavingReview(true);
 
-        const confirmed = window.confirm("Remove your cover photo from this book?");
-        if (!confirmed) return;
+    try {
+      const cleanReview = reviewText.trim();
 
-        setSavingCover(true);
-        setCoverError("");
+      const { data, error: saveError } = await supabase
+        .from("book_reviews")
+        .upsert(
+          {
+            user_id: userId,
+            book_id: book.id,
+            rating,
+            review_text: cleanReview,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "user_id,book_id" }
+        )
+        .select()
+        .single();
 
-        const pathToRemove = book.custom_cover_path;
+      if (saveError) {
+        console.error("Error saving review:", saveError.message);
+        setReviewError("Your review couldn't be saved. Try again.");
+        return;
+      }
 
-        try {
-            const { data, error: updateError } = await supabase
-                .from("books")
-                .update({ custom_cover_path: null })
-                .eq("id", book.id)
-                .eq("user_id", userId)
-                .select("id, user_id, title, author, cover_url, custom_cover_path, status")
-                .single();
+      setReview(data as Review);
+      setReviewText(cleanReview);
+      setInitialRating(rating);
+      setInitialReviewText(cleanReview);
 
-            if (updateError || !data) {
-                console.error("Cover removal failed:", updateError?.message);
-                setCoverError("The cover photo couldn't be removed. Try again.");
-                return;
-            }
+      showToast("success", review ? "Review updated." : "Review saved.");
+    } catch (err) {
+      console.error("Unexpected review save error:", err);
+      setReviewError("Something went wrong while saving your review.");
+    } finally {
+      setSavingReview(false);
+    }
+  }
 
-            const { error: removeError } = await supabase.storage
-                .from(COVER_BUCKET)
-                .remove([pathToRemove]);
-            if (removeError) console.error("Cover file cleanup failed:", removeError.message);
+  function discardReviewChanges() {
+    setRating(initialRating);
+    setReviewText(initialReviewText);
+    setReviewError("");
+  }
 
-            setBook(data as Book);
-            setCustomCoverUrl(null);
+  // ============================================================
+  // Save journal entry
+  // ============================================================
 
-            resetCoverSelection();
-            setShowCoverModal(false);
-            showToast("success", "Cover photo removed.");
-        } finally {
-            setSavingCover(false);
-        }
+  async function saveJournalEntry(event?: FormEvent) {
+    event?.preventDefault();
+    if (!userId || !book || savingJournal) return;
+
+    setJournalError("");
+
+    if (!journalText.trim()) {
+      setJournalError("Write something before saving your note.");
+      return;
     }
 
-    // --------------------------------------------------
-    // Navigation
-    // --------------------------------------------------
-
-    const attemptToLeave = useCallback(
-        (destination: string) => {
-            if (reviewHasChanges) {
-                setPendingDestination(destination);
-                setShowLeaveModal(true);
-                return;
-            }
-
-            router.push(destination);
-        },
-        [reviewHasChanges, router]
-    );
-
-    function discardAndLeave() {
-        const destination = pendingDestination || "/library";
-
-        setShowLeaveModal(false);
-        setPendingDestination(null);
-
-        router.push(destination);
+    if (!journalDate) {
+      setJournalError("Choose a date for this note.");
+      return;
     }
 
-    // --------------------------------------------------
-    // Save review
-    // --------------------------------------------------
-
-    async function saveReview() {
-        if (!userId || !book) return;
-
-        if (rating === 0) {
-            setError("Please select a rating before saving your review.");
-            return;
-        }
-
-        if (!reviewText.trim()) {
-            setError("Please write something before saving your review.");
-            return;
-        }
-
-        setSavingReview(true);
-        setError("");
-
-        try {
-            const cleanReview = reviewText.trim();
-
-            const { data, error: saveError } = await supabase
-                .from("book_reviews")
-                .upsert(
-                    {
-                        user_id: userId,
-                        book_id: book.id,
-                        rating,
-                        review_text: cleanReview,
-                        updated_at: new Date().toISOString(),
-                    },
-                    { onConflict: "user_id,book_id" }
-                )
-                .select()
-                .single();
-
-            if (saveError) {
-                console.error("Error saving review:", saveError);
-                setError("Your review couldn't be saved. Try again.");
-                return;
-            }
-
-            setReview(data);
-            setReviewText(cleanReview);
-            setInitialRating(rating);
-            setInitialReviewText(cleanReview);
-
-            showToast(
-                "success",
-                review ? "Your review has been updated." : "Your review has been saved."
-            );
-        } catch (err) {
-            console.error("Unexpected review save error:", err);
-            setError("Something went wrong while saving your review.");
-        } finally {
-            setSavingReview(false);
-        }
+    const page = parsePage(journalPage);
+    if (page === "invalid") {
+      setJournalError("Page must be a whole number, like 143.");
+      return;
     }
 
-    // --------------------------------------------------
-    // Save journal entry
-    // --------------------------------------------------
-
-    async function saveJournalEntry() {
-        if (!userId || !book) return;
-
-        if (!journalText.trim()) {
-            setError("Write something before saving your entry.");
-            return;
-        }
-
-        if (!journalDate) {
-            setError("Please select a date.");
-            return;
-        }
-
-        setSavingJournal(true);
-        setError("");
-
-        try {
-            const { data, error: journalError } = await supabase
-                .from("book_journal_entries")
-                .insert({
-                    user_id: userId,
-                    book_id: book.id,
-                    entry_date: journalDate,
-                    content: journalText.trim(),
-                })
-                .select()
-                .single();
-
-            if (journalError) {
-                console.error("Error saving journal entry:", journalError);
-                setError("Your journal entry couldn't be saved. Try again.");
-                return;
-            }
-
-            setJournalEntries((current) => sortJournalEntries([data, ...current]));
-            setJournalText("");
-
-            showToast("success", "Your journal entry has been saved.");
-        } catch (err) {
-            console.error("Unexpected journal save error:", err);
-            setError("Something went wrong while saving your journal entry.");
-        } finally {
-            setSavingJournal(false);
-        }
+    const chapter = journalChapter.trim() || null;
+    if (chapter && chapter.length > 100) {
+      setJournalError("Keep the chapter under 100 characters.");
+      return;
     }
 
-    // --------------------------------------------------
-    // Delete journal entry
-    // --------------------------------------------------
+    setSavingJournal(true);
 
-    async function deleteJournalEntry(id: string) {
-        if (!userId) return;
+    try {
+      const { data, error: journalInsertError } = await supabase
+        .from("book_journal_entries")
+        .insert({
+          user_id: userId,
+          book_id: book.id,
+          entry_date: journalDate,
+          content: journalText.trim(),
+          chapter,
+          page_number: page,
+        })
+        .select()
+        .single();
 
-        const confirmed = window.confirm(
-            "Are you sure you want to delete this journal entry?"
-        );
+      if (journalInsertError) {
+        console.error("Error saving journal entry:", journalInsertError.message);
+        setJournalError("Your note couldn't be saved. Try again.");
+        return;
+      }
 
-        if (!confirmed) return;
+      setJournalEntries((current) => [data as JournalEntry, ...current]);
 
-        const previous = journalEntries;
-        setJournalEntries((current) => current.filter((entry) => entry.id !== id));
+      // Keep chapter and page so the next note continues from the same spot
+      setJournalText("");
+      journalTextRef.current?.focus();
 
-        const { error: deleteError } = await supabase
-            .from("book_journal_entries")
-            .delete()
-            .eq("id", id)
-            .eq("user_id", userId);
+      showToast("success", locationLabel(chapter, page) ? `Note saved at ${locationLabel(chapter, page)}.` : "Note saved.");
+    } catch (err) {
+      console.error("Unexpected journal save error:", err);
+      setJournalError("Something went wrong while saving your note.");
+    } finally {
+      setSavingJournal(false);
+    }
+  }
 
-        if (deleteError) {
-            console.error("Error deleting journal entry:", deleteError);
-            setJournalEntries(previous);
-            setError("Could not delete the journal entry.");
-            return;
-        }
+  // ============================================================
+  // Edit journal entry
+  // ============================================================
 
-        showToast("success", "Journal entry deleted.");
+  function startEdit(entry: JournalEntry) {
+    setConfirmDeleteId(null);
+    setEditingId(entry.id);
+    setEditText(entry.content);
+    setEditChapter(entry.chapter || "");
+    setEditPage(entry.page_number != null ? String(entry.page_number) : "");
+    setEditDate(entry.entry_date);
+    setEditError("");
+  }
+
+  function cancelEdit() {
+    setEditingId(null);
+    setEditError("");
+  }
+
+  async function saveEdit() {
+    if (!userId || !editingId || savingEdit) return;
+    setEditError("");
+
+    if (!editText.trim()) {
+      setEditError("A note can't be empty. Delete it instead if you no longer need it.");
+      return;
     }
 
-    const displayRating = hoveredRating || rating;
-
-    // --------------------------------------------------
-    // Loading
-    // --------------------------------------------------
-
-    if (loading) {
-        return (
-            <main className="min-h-screen bg-[#fdfaf3] text-[#0f172a]">
-                <Navbar isLoggedIn={!!userId} />
-
-                <div className="max-w-6xl mx-auto px-5 sm:px-8 py-12">
-                    <div className="animate-pulse">
-                        <div className="h-4 w-28 bg-slate-900/10 rounded-full mb-12" />
-
-                        <div className="grid lg:grid-cols-[250px_1fr] gap-10">
-                            <div className="aspect-[2/3] rounded-[1.5rem] bg-slate-900/10" />
-
-                            <div className="pt-5">
-                                <div className="h-4 w-36 bg-slate-900/10 rounded-full mb-6" />
-                                <div className="h-14 w-3/4 bg-slate-900/10 rounded-xl mb-5" />
-                                <div className="h-5 w-48 bg-slate-900/10 rounded-full" />
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </main>
-        );
+    const page = parsePage(editPage);
+    if (page === "invalid") {
+      setEditError("Page must be a whole number, like 143.");
+      return;
     }
 
-    // --------------------------------------------------
-    // Book not found
-    // --------------------------------------------------
+    setSavingEdit(true);
 
-    if (!book) {
-        return (
-            <main className="min-h-screen bg-[#fdfaf3] text-[#0f172a]">
-                <Navbar isLoggedIn={!!userId} />
+    const { data, error: updateError } = await supabase
+      .from("book_journal_entries")
+      .update({
+        content: editText.trim(),
+        chapter: editChapter.trim() || null,
+        page_number: page,
+        entry_date: editDate || todayLocal(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", editingId)
+      .eq("user_id", userId)
+      .select()
+      .single();
 
-                <section className="max-w-4xl mx-auto px-5 sm:px-8 py-24 text-center">
-                    <div className="w-20 h-20 mx-auto rounded-full bg-[#f7f5fa] flex items-center justify-center mb-7">
-                        <span className="font-classical text-3xl text-[#9a86b9]">A</span>
-                    </div>
+    setSavingEdit(false);
 
-                    <h1 className="text-4xl md:text-5xl font-classical font-semibold text-[#0f172a] mt-3">
-                        Book not found
-                    </h1>
-
-                    <p className="text-slate-600 mt-4 max-w-md mx-auto leading-7 font-light">
-                        {error || "We couldn't find this book in your library."}
-                    </p>
-
-                    <button
-                        type="button"
-                        onClick={() => router.push("/library")}
-                        className="mt-8 bg-[#0f172a] text-[#fdfaf3] px-7 py-3.5 rounded-full hover:bg-[#1e293b] transition-all"
-                    >
-                        Back to My Library
-                    </button>
-                </section>
-            </main>
-        );
+    if (updateError || !data) {
+      console.error("Error updating journal entry:", updateError?.message);
+      setEditError("Your changes couldn't be saved. Try again.");
+      return;
     }
 
-    const hasCustomCover = !!book.custom_cover_path;
-    const modalPreviewSources = coverPreview
-        ? [coverPreview]
-        : customCoverUrl
-            ? [customCoverUrl]
-            : [];
+    setJournalEntries((current) => current.map((e) => (e.id === editingId ? (data as JournalEntry) : e)));
+    setEditingId(null);
+    showToast("success", "Note updated.");
+  }
 
+  // ============================================================
+  // Delete journal entry
+  // ============================================================
+
+  async function deleteJournalEntry(id: string) {
+    if (!userId) return;
+
+    setConfirmDeleteId(null);
+    const previous = journalEntries;
+    setJournalEntries((current) => current.filter((entry) => entry.id !== id));
+
+    const { error: deleteError } = await supabase
+      .from("book_journal_entries")
+      .delete()
+      .eq("id", id)
+      .eq("user_id", userId);
+
+    if (deleteError) {
+      console.error("Error deleting journal entry:", deleteError.message);
+      setJournalEntries(previous);
+      showToast("error", "The note couldn't be deleted. Try again.");
+      return;
+    }
+
+    showToast("success", "Note deleted.");
+  }
+
+  // ============================================================
+  // Loading
+  // ============================================================
+
+  if (loading) {
     return (
-        <main className="min-h-screen bg-[#fdfaf3] text-[#0f172a] font-sans selection:bg-[#d8d0e3] selection:text-[#0f172a]">
-            {/* ==================================================
-          PAGE ATMOSPHERE
-      ================================================== */}
+      <main className="min-h-screen bg-[#fdfaf3] text-[#0f172a]">
+        <Navbar isLoggedIn={!!userId || undefined} />
 
-            <div className="fixed inset-0 pointer-events-none overflow-hidden -z-10">
-                <div className="absolute top-0 left-1/2 -translate-x-1/2 w-[800px] h-[500px] bg-[#d8d0e3]/20 rounded-full blur-[120px]" />
-                <div className="absolute top-0 right-0 w-[600px] h-[600px] bg-[#89a08a]/10 rounded-full blur-[120px]" />
+        <div className="max-w-6xl mx-auto px-5 sm:px-8 py-12" aria-busy="true" aria-label="Loading book">
+          <div className="animate-pulse">
+            <div className="h-4 w-28 bg-slate-900/10 rounded-full mb-12" />
+            <div className="grid lg:grid-cols-[250px_1fr] gap-10">
+              <div className="aspect-[2/3] rounded-[1.5rem] bg-slate-900/10" />
+              <div className="pt-5">
+                <div className="h-4 w-36 bg-slate-900/10 rounded-full mb-6" />
+                <div className="h-14 w-3/4 bg-slate-900/10 rounded-xl mb-5" />
+                <div className="h-5 w-48 bg-slate-900/10 rounded-full" />
+              </div>
             </div>
+          </div>
+        </div>
+      </main>
+    );
+  }
 
-            <style
-                dangerouslySetInnerHTML={{
-                    __html: `
+  // ============================================================
+  // Book not found
+  // ============================================================
+
+  if (!book) {
+    return (
+      <main className="min-h-screen bg-[#fdfaf3] text-[#0f172a]">
+        <Navbar isLoggedIn={!!userId || undefined} />
+
+        <section className="max-w-4xl mx-auto px-5 sm:px-8 py-24 text-center">
+          <div className="w-20 h-20 mx-auto rounded-full bg-[#f7f5fa] flex items-center justify-center mb-7">
+            <span className="font-classical text-3xl text-[#9a86b9]">A</span>
+          </div>
+
+          <h1 className="text-4xl md:text-5xl font-classical font-semibold mt-3">Book not found</h1>
+
+          <p className="text-slate-600 mt-4 max-w-md mx-auto leading-7 font-light">
+            {loadError || "We couldn't find this book in your library."}
+          </p>
+
+          <button
+            type="button"
+            onClick={() => router.push("/library")}
+            className={`mt-8 bg-[#0f172a] text-[#fdfaf3] px-7 py-3.5 rounded-full hover:bg-[#1e293b] transition-all ${focusRing}`}
+          >
+            Back to My Library
+          </button>
+        </section>
+      </main>
+    );
+  }
+
+  const hasCustomCover = !!book.custom_cover_path;
+  const modalPreviewSources = coverPreview ? [coverPreview] : customCoverUrl ? [customCoverUrl] : [];
+
+  // ============================================================
+  // Render
+  // ============================================================
+
+  return (
+    <main className="min-h-screen bg-[#fdfaf3] text-[#0f172a] font-sans selection:bg-[#d8d0e3] selection:text-[#0f172a]">
+      <div className="fixed inset-0 pointer-events-none overflow-hidden -z-10">
+        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-[800px] h-[500px] bg-[#d8d0e3]/20 rounded-full blur-[120px]" />
+        <div className="absolute top-0 right-0 w-[600px] h-[600px] bg-[#89a08a]/10 rounded-full blur-[120px]" />
+      </div>
+
+      <style
+        dangerouslySetInnerHTML={{
+          __html: `
             @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500;1,600&display=swap');
 
             .font-classical { font-family: 'Playfair Display', Georgia, serif; }
 
             .journal-paper {
-  --line: 32px;                 /* row height; text line-height matches it */
-  --pad: 16px;                  /* top/bottom padding; rules start here */
-  --rule: rgba(15, 23, 42, 0.08);
-  --rule-at: calc(var(--line) * 0.78); /* rule sits just under the baseline */
+              --line: 32px;
+              --pad: 16px;
+              --rule: rgba(15, 23, 42, 0.08);
+              --rule-at: calc(var(--line) * 0.78);
 
-  line-height: var(--line);
-  padding-top: var(--pad);
-  padding-bottom: var(--pad);
+              line-height: var(--line);
+              padding-top: var(--pad);
+              padding-bottom: var(--pad);
 
-  background-color: #fefcf6;
-  background-image: linear-gradient(
-    to bottom,
-    transparent var(--rule-at),
-    var(--rule) var(--rule-at),
-    var(--rule) calc(var(--rule-at) + 1px),
-    transparent calc(var(--rule-at) + 1px)
-  );
-  background-size: 100% var(--line);
-  background-position: 0 var(--pad);
-  background-repeat: repeat;
-  background-attachment: local;  /* lines scroll with the text */
-}
+              background-color: #fefcf6;
+              background-image: linear-gradient(
+                to bottom,
+                transparent var(--rule-at),
+                var(--rule) var(--rule-at),
+                var(--rule) calc(var(--rule-at) + 1px),
+                transparent calc(var(--rule-at) + 1px)
+              );
+              background-size: 100% var(--line);
+              background-position: 0 var(--pad);
+              background-repeat: repeat;
+              background-attachment: local;
+            }
 
-.journal-paper--lg { --pad: 20px; }
+            .journal-paper--lg { --pad: 20px; }
 
-            .soft-surface { background: rgba(255, 255, 255, 0.6); backdrop-filter: blur(12px); }
+            .soft-surface { background: rgba(255, 255, 255, 0.65); backdrop-filter: blur(12px); }
             .soft-border { border-color: rgba(15, 23, 42, 0.08); }
 
             @keyframes sheet-in { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
             .animate-sheet-in { animation: sheet-in 300ms cubic-bezier(.2,.8,.2,1) both; }
             @media (prefers-reduced-motion: reduce) { .animate-sheet-in { animation: none; } }
           `,
-                }}
-            />
+        }}
+      />
 
-            <Navbar isLoggedIn={!!userId} />
+      <Navbar isLoggedIn={!!userId || undefined} />
 
-            {/* ==================================================
-          TOAST
-      ================================================== */}
+      {/* ================= Toast ================= */}
+      {toast && (
+        <div className="fixed bottom-5 inset-x-5 sm:inset-x-auto sm:right-6 sm:bottom-6 z-[70] sm:max-w-sm" role="status" aria-live="polite">
+          <div
+            className={`flex items-center gap-3 rounded-2xl px-5 py-4 shadow-[0_15px_45px_rgba(15,23,42,0.15)] border ${
+              toast.type === "success" ? "bg-white border-[#7a947c]/25" : "bg-[#fbefed] border-red-200/70"
+            }`}
+          >
+            <span
+              aria-hidden="true"
+              className={`w-7 h-7 rounded-full flex items-center justify-center text-sm text-white shrink-0 ${
+                toast.type === "success" ? "bg-[#7a947c]" : "bg-[#c0675b]"
+              }`}
+            >
+              {toast.type === "success" ? "✓" : "!"}
+            </span>
+            <p className={`flex-1 text-sm font-medium ${toast.type === "success" ? "text-[#4a5c4b]" : "text-[#a14e43]"}`}>
+              {toast.message}
+            </p>
+            <button
+              type="button"
+              onClick={() => setToast(null)}
+              className={`text-slate-400 hover:text-[#0f172a] text-lg leading-none rounded ${focusRing}`}
+              aria-label="Dismiss notification"
+            >
+              ×
+            </button>
+          </div>
+        </div>
+      )}
 
-            {toast && (
-                <div className="fixed top-24 right-5 z-[70] w-[calc(100%-40px)] sm:w-auto sm:min-w-[320px] sm:max-w-sm" role="status">
-                    <div
-                        className={`flex items-start gap-3 rounded-2xl px-5 py-4 shadow-[0_15px_45px_rgba(15,23,42,0.12)] border backdrop-blur-xl ${toast.type === "success"
-                            ? "bg-white/95 border-[#7a947c]/25"
-                            : "bg-[#fbefed]/95 border-red-200/70"
-                            }`}
-                    >
-                        <div
-                            className={`mt-0.5 w-7 h-7 rounded-full flex items-center justify-center text-sm shrink-0 ${toast.type === "success" ? "bg-[#7a947c] text-white" : "bg-red-500 text-white"
-                                }`}
-                        >
-                            {toast.type === "success" ? "✓" : "!"}
-                        </div>
+      <section className="max-w-6xl mx-auto px-5 sm:px-8 lg:px-10 pt-7 md:pt-10 pb-24 relative z-10">
+        <button
+          type="button"
+          onClick={() => attemptToLeave("/library")}
+          className={`group inline-flex items-center gap-2 text-sm text-slate-500 hover:text-[#0f172a] transition-colors mb-8 md:mb-10 rounded ${focusRing}`}
+        >
+          <span aria-hidden="true" className="text-lg transition-transform group-hover:-translate-x-1">←</span>
+          <span>Back to My Library</span>
+        </button>
 
-                        <p
-                            className={`flex-1 text-sm font-medium ${toast.type === "success" ? "text-[#4a5c4b]" : "text-red-700"
-                                }`}
-                        >
-                            {toast.message}
-                        </p>
+        {/* ================= Hero ================= */}
+        <div className="grid lg:grid-cols-[235px_minmax(0,1fr)] xl:grid-cols-[260px_minmax(0,1fr)] gap-8 lg:gap-12 xl:gap-16 items-start">
+          <div className="w-44 sm:w-52 lg:w-full mx-auto lg:mx-0">
+            <div className="relative group">
+              <div className="absolute -inset-4 bg-[#0f172a]/8 rounded-[2rem] blur-2xl opacity-60" />
 
-                        <button
-                            type="button"
-                            onClick={() => setToast(null)}
-                            className="text-slate-400 hover:text-[#0f172a] text-lg leading-none"
-                            aria-label="Dismiss notification"
-                        >
-                            ×
-                        </button>
-                    </div>
+              <div className="relative aspect-[2/3] rounded-[1.35rem] overflow-hidden shadow-[0_24px_55px_rgba(15,23,42,0.18)] bg-slate-200 ring-1 ring-[#0f172a]/10">
+                <CoverImage sources={coverSources} title={book.title} author={book.author} />
+
+                <div className="absolute inset-x-0 bottom-0 p-3 bg-gradient-to-t from-[#0f172a]/70 to-transparent lg:opacity-0 lg:group-hover:opacity-100 lg:focus-within:opacity-100 transition-opacity">
+                  <button
+                    type="button"
+                    onClick={openCoverModal}
+                    className="w-full inline-flex items-center justify-center gap-2 bg-[#fdfaf3]/95 text-[#0f172a] text-xs font-semibold py-2.5 rounded-full hover:bg-white transition-colors outline-none focus-visible:ring-2 focus-visible:ring-[#7a947c]"
+                  >
+                    <CameraIcon />
+                    {hasCustomCover ? "Change cover photo" : "Add cover photo"}
+                  </button>
                 </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="lg:pt-2 min-w-0">
+            <span className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-[#f7f5fa] text-[#6c5c85] text-xs font-medium border border-[#9a86b9]/20">
+              <span aria-hidden="true" className="w-1.5 h-1.5 rounded-full bg-[#9a86b9]" />
+              {STATUS_LABEL[book.status ?? ""] ?? "Want to read"}
+            </span>
+
+            <h1 className="mt-5 text-[2.6rem] sm:text-5xl md:text-6xl xl:text-[4.2rem] font-classical font-semibold leading-[1.03] max-w-4xl break-words">
+              {book.title}
+            </h1>
+
+            {book.author && (
+              <p className="text-lg sm:text-xl text-slate-500 mt-4 font-light">
+                by <span className="text-slate-700">{book.author}</span>
+              </p>
             )}
 
-            {/* ==================================================
-          MAIN CONTENT
-      ================================================== */}
+            {/* At-a-glance: notes, progress, rating */}
+            <dl className="mt-7 grid grid-cols-3 max-w-lg rounded-2xl border border-[#0f172a]/8 bg-white/60 divide-x divide-[#0f172a]/8">
+              <div className="px-4 py-3.5">
+                <dt className="text-xs text-slate-400">Notes</dt>
+                <dd className="font-classical text-2xl mt-0.5">{journalEntries.length}</dd>
+              </div>
+              <div className="px-4 py-3.5">
+                <dt className="text-xs text-slate-400">Furthest page</dt>
+                <dd className="font-classical text-2xl mt-0.5">{furthestPage ?? "—"}</dd>
+              </div>
+              <div className="px-4 py-3.5">
+                <dt className="text-xs text-slate-400">Your rating</dt>
+                <dd className="mt-1.5 flex items-center gap-0.5" aria-label={review?.rating ? `${review.rating} out of 5` : "Not rated"}>
+                  {review?.rating ? (
+                    [1, 2, 3, 4, 5].map((star) => (
+                      <span key={star} aria-hidden="true" className={star <= (review.rating || 0) ? "text-[#c5a24a]" : "text-slate-200"}>
+                        ★
+                      </span>
+                    ))
+                  ) : (
+                    <span className="font-classical text-2xl leading-none">—</span>
+                  )}
+                </dd>
+              </div>
+            </dl>
 
-            <section className="max-w-6xl mx-auto px-5 sm:px-8 lg:px-10 pt-7 md:pt-10 pb-24 relative z-10">
+            <div className="flex flex-col sm:flex-row gap-3 mt-7">
+              <button
+                type="button"
+                onClick={goToComposer}
+                className={`inline-flex items-center justify-center gap-2.5 bg-[#7a947c] text-white px-6 py-3.5 rounded-full text-sm font-medium hover:bg-[#6b826c] transition-all shadow-[0_8px_20px_rgba(122,148,124,0.25)] ${focusRing}`}
+              >
+                <span aria-hidden="true">✎</span>
+                Add a note
+              </button>
+
+              <button
+                type="button"
+                onClick={goToReview}
+                className={`inline-flex items-center justify-center gap-2.5 bg-white/70 text-slate-700 border border-[#0f172a]/10 px-6 py-3.5 rounded-full text-sm font-medium hover:bg-white hover:text-[#0f172a] transition-all ${focusRing}`}
+              >
+                <span aria-hidden="true" className="text-[#c5a24a]">★</span>
+                {review ? "Edit your review" : "Write your review"}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* ================= Tabs ================= */}
+        <div className="mt-14 md:mt-16 mb-8 border-b border-[#0f172a]/8">
+          <div role="tablist" aria-label="Journal and review" className="flex gap-6 sm:gap-8">
+            {(
+              [
+                { id: "journal", label: "Reading journal", badge: journalEntries.length ? String(journalEntries.length) : null, dirty: journalHasDraft || editingId !== null },
+                { id: "review", label: "Final review", badge: review ? "✓" : null, dirty: reviewHasChanges },
+              ] as const
+            ).map((tab) => {
+              const active = activeTab === tab.id;
+              return (
                 <button
-                    type="button"
-                    onClick={() => attemptToLeave("/library")}
-                    className="group inline-flex items-center gap-2 text-sm text-slate-500 hover:text-[#0f172a] transition-colors mb-8 md:mb-10"
+                  key={tab.id}
+                  id={`tab-${tab.id}`}
+                  type="button"
+                  role="tab"
+                  aria-selected={active}
+                  aria-controls={`panel-${tab.id}`}
+                  onClick={() => setActiveTab(tab.id)}
+                  className={`relative -mb-px pb-3.5 pt-1 inline-flex items-center gap-2 font-classical text-xl sm:text-2xl transition-colors rounded-t ${focusRing} ${
+                    active ? "text-[#0f172a]" : "text-slate-400 hover:text-slate-600"
+                  }`}
                 >
-                    <span className="text-lg transition-transform group-hover:-translate-x-1">←</span>
-                    <span>Back to My Library</span>
+                  {tab.label}
+                  {tab.badge && (
+                    <span
+                      className={`font-sans text-[11px] min-w-5 h-5 px-1.5 rounded-full inline-flex items-center justify-center ${
+                        active ? "bg-[#0f172a] text-white" : "bg-slate-100 text-slate-500"
+                      }`}
+                    >
+                      {tab.badge}
+                    </span>
+                  )}
+                  {tab.dirty && (
+                    <span className="w-1.5 h-1.5 rounded-full bg-[#c69a3d]" aria-label="Unsaved changes" />
+                  )}
+                  <span
+                    aria-hidden="true"
+                    className={`absolute left-0 right-0 bottom-0 h-0.5 rounded-full bg-[#7a947c] transition-transform origin-left ${
+                      active ? "scale-x-100" : "scale-x-0"
+                    }`}
+                  />
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* ================= Journal ================= */}
+        {activeTab === "journal" && (
+          <div
+            id="panel-journal"
+            role="tabpanel"
+            aria-labelledby="tab-journal"
+            className="grid lg:grid-cols-[360px_minmax(0,1fr)] gap-8 lg:gap-10 items-start scroll-mt-28"
+          >
+            {/* Composer */}
+            <form
+              id="journal-composer"
+              onSubmit={saveJournalEntry}
+              className="lg:sticky lg:top-24 scroll-mt-28 soft-surface rounded-[1.6rem] border soft-border shadow-[0_15px_45px_rgba(15,23,42,0.06)] p-5 sm:p-6"
+              noValidate
+            >
+              <h2 className="font-classical text-2xl font-semibold">New note</h2>
+              <p className="text-sm text-slate-500 mt-1 font-light">Jot down a moment, a quote or a theory.</p>
+
+              {/* Where in the book */}
+              <div className="mt-5 grid grid-cols-[1fr_1fr] gap-3">
+                <div>
+                  <label htmlFor="journal-chapter" className="block text-xs font-medium text-slate-500 mb-1.5">
+                    Chapter
+                  </label>
+                  <input
+                    id="journal-chapter"
+                    type="text"
+                    inputMode="text"
+                    maxLength={100}
+                    value={journalChapter}
+                    onChange={(e) => setJournalChapter(e.target.value)}
+                    placeholder="12 or Prologue"
+                    className={fieldClass}
+                  />
+                </div>
+                <div>
+                  <label htmlFor="journal-page" className="block text-xs font-medium text-slate-500 mb-1.5">
+                    Page
+                  </label>
+                  <input
+                    id="journal-page"
+                    type="number"
+                    inputMode="numeric"
+                    min={1}
+                    max={100000}
+                    value={journalPage}
+                    onChange={(e) => setJournalPage(e.target.value)}
+                    placeholder="143"
+                    className={fieldClass}
+                  />
+                </div>
+              </div>
+
+              <div className="mt-4">
+                <label htmlFor="journal" className="sr-only">
+                  Your note
+                </label>
+                <textarea
+                  id="journal"
+                  ref={journalTextRef}
+                  value={journalText}
+                  onChange={(e) => setJournalText(e.target.value)}
+                  onKeyDown={(e) => onSaveShortcut(e, () => saveJournalEntry())}
+                  placeholder="What's on your mind at this point in the book?"
+                  rows={8}
+                  className="journal-paper w-full px-4 border border-[#0f172a]/10 rounded-xl resize-y min-h-[200px] text-sm text-slate-700 placeholder:text-slate-300 focus:outline-none focus:border-[#7a947c] focus:ring-4 focus:ring-[#7a947c]/10 transition-all"
+                />
+              </div>
+
+              <div className="mt-3 flex items-center justify-between gap-3">
+                <label htmlFor="journal-date" className="flex items-center gap-2 text-xs text-slate-500">
+                  <span>Date</span>
+                  <input
+                    id="journal-date"
+                    type="date"
+                    value={journalDate}
+                    max={todayLocal()}
+                    onChange={(e) => setJournalDate(e.target.value)}
+                    className="h-8 px-2 bg-white border border-[#0f172a]/10 rounded-lg text-xs text-slate-600 focus:outline-none focus:border-[#7a947c]"
+                  />
+                </label>
+                <span className="text-[11px] text-slate-400 hidden sm:inline">{saveShortcut} to save</span>
+              </div>
+
+              {journalError && (
+                <p role="alert" className="mt-3 text-sm text-[#a14e43]">
+                  {journalError}
+                </p>
+              )}
+
+              <button
+                type="submit"
+                disabled={savingJournal || !journalText.trim()}
+                className={`w-full mt-4 bg-[#7a947c] text-white h-12 rounded-full font-semibold text-sm hover:bg-[#6b826c] disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-[0_8px_20px_rgba(122,148,124,0.2)] inline-flex items-center justify-center gap-2 ${focusRing}`}
+              >
+                {savingJournal && <Spinner />}
+                {savingJournal ? "Saving…" : composerLocation ? `Save note at ${composerLocation}` : "Save note"}
+              </button>
+
+              <p className="text-[11px] text-slate-400 mt-3 text-center">Private to you. Chapter and page carry over to your next note.</p>
+            </form>
+
+            {/* Entries */}
+            <div className="min-w-0">
+              <div className="flex items-center justify-between gap-4 mb-5">
+                <p className="text-sm text-slate-500">
+                  {journalEntries.length} {journalEntries.length === 1 ? "note" : "notes"}
+                </p>
+
+                {journalEntries.length > 1 && (
+                  <div role="group" aria-label="Sort notes" className="inline-flex p-1 rounded-full bg-[#0f172a]/5 text-xs">
+                    {(["recent", "page"] as SortMode[]).map((mode) => (
+                      <button
+                        key={mode}
+                        type="button"
+                        onClick={() => setSortMode(mode)}
+                        aria-pressed={sortMode === mode}
+                        className={`h-8 px-3.5 rounded-full font-medium transition-all ${focusRing} ${
+                          sortMode === mode ? "bg-white text-[#0f172a] shadow-sm" : "text-slate-500 hover:text-[#0f172a]"
+                        }`}
+                      >
+                        {mode === "recent" ? "Newest first" : "Book order"}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {journalEntries.length === 0 ? (
+                <div className="soft-surface border border-dashed border-[#0f172a]/12 rounded-[1.6rem] p-10 sm:p-14 text-center">
+                  <div className="w-16 h-16 mx-auto rounded-full bg-[#f7f5fa] flex items-center justify-center mb-5">
+                    <span className="font-classical text-2xl text-[#9a86b9]">A</span>
+                  </div>
+                  <h3 className="font-classical text-2xl font-semibold">No notes yet</h3>
+                  <p className="text-sm text-slate-500 mt-2 max-w-sm mx-auto leading-6 font-light">
+                    Add the chapter or page with each note, and you&apos;ll be able to read your thoughts back in book order.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={goToComposer}
+                    className={`mt-6 text-sm font-semibold text-[#4a5c4b] underline underline-offset-4 decoration-[#7a947c]/40 hover:text-[#0f172a] rounded ${focusRing}`}
+                  >
+                    Write your first note
+                  </button>
+                </div>
+              ) : (
+                <ol className="relative space-y-5">
+                  <span aria-hidden="true" className="absolute left-[17px] top-4 bottom-4 w-px bg-[#0f172a]/10 hidden sm:block" />
+
+                  {sortedEntries.map((entry) => {
+                    const location = locationLabel(entry.chapter, entry.page_number);
+                    const isEditing = editingId === entry.id;
+                    const confirmingDelete = confirmDeleteId === entry.id;
+
+                    return (
+                      <li key={entry.id} className="relative sm:pl-12">
+                        <span
+                          aria-hidden="true"
+                          className="hidden sm:flex absolute left-0 top-5 w-9 h-9 rounded-full bg-[#fdfaf3] border border-[#0f172a]/10 items-center justify-center text-[10px] font-semibold text-[#4a5c4b]"
+                        >
+                          {entry.page_number != null ? (entry.page_number > 999 ? "p." : entry.page_number) : <span className="w-2 h-2 rounded-full bg-[#7a947c]" />}
+                        </span>
+
+                        <article className="soft-surface border soft-border rounded-[1.4rem] shadow-[0_8px_30px_rgba(15,23,42,0.04)] overflow-hidden">
+                          {isEditing ? (
+                            // ---------- Edit mode ----------
+                            <div className="p-5 sm:p-6">
+                              <div className="grid grid-cols-3 gap-3">
+                                <div>
+                                  <label htmlFor={`edit-chapter-${entry.id}`} className="block text-xs text-slate-500 mb-1.5">Chapter</label>
+                                  <input id={`edit-chapter-${entry.id}`} type="text" maxLength={100} value={editChapter} onChange={(e) => setEditChapter(e.target.value)} className={fieldClass} />
+                                </div>
+                                <div>
+                                  <label htmlFor={`edit-page-${entry.id}`} className="block text-xs text-slate-500 mb-1.5">Page</label>
+                                  <input id={`edit-page-${entry.id}`} type="number" inputMode="numeric" min={1} max={100000} value={editPage} onChange={(e) => setEditPage(e.target.value)} className={fieldClass} />
+                                </div>
+                                <div>
+                                  <label htmlFor={`edit-date-${entry.id}`} className="block text-xs text-slate-500 mb-1.5">Date</label>
+                                  <input id={`edit-date-${entry.id}`} type="date" max={todayLocal()} value={editDate} onChange={(e) => setEditDate(e.target.value)} className={fieldClass} />
+                                </div>
+                              </div>
+
+                              <label htmlFor={`edit-text-${entry.id}`} className="sr-only">Note</label>
+                              <textarea
+                                id={`edit-text-${entry.id}`}
+                                value={editText}
+                                autoFocus
+                                onChange={(e) => setEditText(e.target.value)}
+                                onKeyDown={(e) => {
+                                  onSaveShortcut(e, saveEdit);
+                                  if (e.key === "Escape") cancelEdit();
+                                }}
+                                rows={6}
+                                className="journal-paper mt-3 w-full px-4 border border-[#0f172a]/10 rounded-xl resize-y text-[15px] text-slate-700 focus:outline-none focus:border-[#7a947c] focus:ring-4 focus:ring-[#7a947c]/10 transition-all"
+                              />
+
+                              {editError && (
+                                <p role="alert" className="mt-2 text-sm text-[#a14e43]">
+                                  {editError}
+                                </p>
+                              )}
+
+                              <div className="mt-3 flex items-center justify-end gap-2">
+                                <button
+                                  type="button"
+                                  onClick={cancelEdit}
+                                  disabled={savingEdit}
+                                  className={`h-10 px-4 rounded-full text-sm text-slate-500 hover:text-[#0f172a] hover:bg-[#0f172a]/5 transition-colors ${focusRing}`}
+                                >
+                                  Cancel
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={saveEdit}
+                                  disabled={savingEdit}
+                                  className={`h-10 px-5 rounded-full bg-[#0f172a] text-[#fdfaf3] text-sm font-medium hover:bg-[#7a947c] disabled:opacity-50 transition-colors inline-flex items-center gap-2 ${focusRing}`}
+                                >
+                                  {savingEdit && <Spinner />}
+                                  Save changes
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            // ---------- Read mode ----------
+                            <div className="p-5 sm:p-6">
+                              <header className="flex flex-wrap items-center gap-x-3 gap-y-2">
+                                {location && (
+                                  <span className="inline-flex items-center px-2.5 py-1 rounded-full bg-[#eef3ee] text-[#4a5c4b] text-xs font-semibold">
+                                    {location}
+                                  </span>
+                                )}
+                                <time dateTime={entry.entry_date} className="text-xs text-slate-400" title={formatEntryDate(entry.entry_date, "long")}>
+                                  {formatEntryDate(entry.entry_date, "short")}
+                                </time>
+
+                                <div className="ml-auto flex items-center gap-1">
+                                  {confirmingDelete ? (
+                                    <>
+                                      <span className="text-xs text-slate-500 mr-1">Delete this note?</span>
+                                      <button
+                                        type="button"
+                                        onClick={() => deleteJournalEntry(entry.id)}
+                                        className={`text-xs font-medium text-white bg-[#c0675b] hover:bg-[#a14e43] px-3 py-1.5 rounded-lg transition-colors ${focusRing}`}
+                                      >
+                                        Delete
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => setConfirmDeleteId(null)}
+                                        className={`text-xs text-slate-500 hover:text-[#0f172a] px-2.5 py-1.5 rounded-lg hover:bg-[#0f172a]/5 transition-colors ${focusRing}`}
+                                      >
+                                        Keep
+                                      </button>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <button
+                                        type="button"
+                                        onClick={() => startEdit(entry)}
+                                        aria-label={`Edit note${location ? ` at ${location}` : ""}`}
+                                        className={`text-xs text-slate-400 hover:text-[#0f172a] px-2.5 py-1.5 rounded-lg hover:bg-[#0f172a]/5 transition-colors ${focusRing}`}
+                                      >
+                                        Edit
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setEditingId(null);
+                                          setConfirmDeleteId(entry.id);
+                                        }}
+                                        aria-label={`Delete note${location ? ` at ${location}` : ""}`}
+                                        className={`text-xs text-slate-400 hover:text-[#a34d43] px-2.5 py-1.5 rounded-lg hover:bg-[#f7e9e6] transition-colors ${focusRing}`}
+                                      >
+                                        Delete
+                                      </button>
+                                    </>
+                                  )}
+                                </div>
+                              </header>
+
+                              <p className="mt-3.5 text-slate-700 leading-8 whitespace-pre-wrap text-[15px] font-light">{entry.content}</p>
+                            </div>
+                          )}
+                        </article>
+                      </li>
+                    );
+                  })}
+                </ol>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ================= Review ================= */}
+        {activeTab === "review" && (
+          <div id="panel-review" role="tabpanel" aria-labelledby="tab-review" className="max-w-3xl scroll-mt-28">
+            <div className="soft-surface rounded-[1.6rem] border soft-border shadow-[0_10px_35px_rgba(15,23,42,0.05)] overflow-hidden">
+              {/* Rating */}
+              <fieldset className="p-6 sm:p-8 border-b border-[#0f172a]/6">
+                <legend className="sr-only">Your rating</legend>
+                <div className="flex flex-col sm:flex-row sm:items-center gap-4 sm:gap-6">
+                  <div className="flex items-center gap-1" onMouseLeave={() => setHoveredRating(0)}>
+                    {[1, 2, 3, 4, 5].map((star) => (
+                      <button
+                        key={star}
+                        type="button"
+                        onClick={() => setRating(star === rating ? 0 : star)}
+                        onMouseEnter={() => setHoveredRating(star)}
+                        onFocus={() => setHoveredRating(star)}
+                        onBlur={() => setHoveredRating(0)}
+                        aria-label={`${star} out of 5${RATING_LABEL[star] ? `: ${RATING_LABEL[star]}` : ""}`}
+                        aria-pressed={rating === star}
+                        className={`w-11 h-11 sm:w-12 sm:h-12 rounded-xl flex items-center justify-center text-3xl transition-all ${focusRing} ${
+                          star <= displayRating ? "text-[#c5a24a] scale-105" : "text-slate-200 hover:text-[#c5a24a]/60"
+                        }`}
+                      >
+                        <span aria-hidden="true">★</span>
+                      </button>
+                    ))}
+                  </div>
+
+                  <p className="text-sm" aria-live="polite">
+                    {displayRating > 0 ? (
+                      <>
+                        <span className="font-semibold text-slate-700">{RATING_LABEL[displayRating]}</span>
+                        <span className="text-slate-400"> · {displayRating}/5</span>
+                      </>
+                    ) : (
+                      <span className="text-slate-400">Tap a star to rate this book</span>
+                    )}
+                  </p>
+                </div>
+              </fieldset>
+
+              {/* Review text */}
+              <div className="p-6 sm:p-8">
+                <label htmlFor="review" className="sr-only">
+                  Your review
+                </label>
+                <textarea
+                  id="review"
+                  value={reviewText}
+                  onChange={(e) => setReviewText(e.target.value)}
+                  onKeyDown={(e) => onSaveShortcut(e, saveReview)}
+                  placeholder="What stayed with you? The characters, the writing, the ending, a line you keep thinking about…"
+                  rows={12}
+                  className="journal-paper journal-paper--lg w-full px-5 border border-[#0f172a]/10 rounded-2xl resize-y min-h-[300px] text-[15px] text-slate-700 placeholder:text-slate-300 focus:outline-none focus:border-[#7a947c] focus:ring-4 focus:ring-[#7a947c]/10 transition-all"
+                />
+
+                <div className="mt-2 flex items-center justify-between text-[11px] text-slate-400">
+                  <span>
+                    {review?.updated_at
+                      ? `Last saved ${new Date(review.updated_at).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })}`
+                      : "Private to you"}
+                  </span>
+                  <span>{reviewText.trim() ? `${reviewText.trim().split(/\s+/).length} words` : ""}</span>
+                </div>
+
+                {journalEntries.length > 0 && !reviewText.trim() && (
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab("journal")}
+                    className={`mt-4 text-sm text-[#4a5c4b] underline underline-offset-4 decoration-[#7a947c]/40 hover:text-[#0f172a] rounded ${focusRing}`}
+                  >
+                    Look back at your {journalEntries.length} {journalEntries.length === 1 ? "note" : "notes"} first
+                  </button>
+                )}
+
+                {reviewError && (
+                  <p role="alert" className="mt-4 text-sm text-[#a14e43]">
+                    {reviewError}
+                  </p>
+                )}
+              </div>
+
+              {/* Save bar */}
+              <div className="sticky bottom-0 px-6 sm:px-8 py-4 bg-[#fdfaf3]/95 backdrop-blur border-t border-[#0f172a]/6 flex flex-col-reverse sm:flex-row sm:items-center gap-3">
+                <p className="text-xs flex-1" aria-live="polite">
+                  {reviewHasChanges ? (
+                    <span className="inline-flex items-center gap-1.5 text-[#a47a25]">
+                      <span aria-hidden="true" className="w-1.5 h-1.5 rounded-full bg-[#c69a3d]" />
+                      Unsaved changes
+                      <span className="hidden sm:inline text-slate-400">· {saveShortcut} to save</span>
+                    </span>
+                  ) : review ? (
+                    <span className="text-slate-400">All changes saved</span>
+                  ) : null}
+                </p>
+
+                {reviewHasChanges && (initialRating > 0 || initialReviewText) && (
+                  <button
+                    type="button"
+                    onClick={discardReviewChanges}
+                    className={`h-11 px-5 rounded-full text-sm text-slate-500 hover:text-[#0f172a] hover:bg-[#0f172a]/5 transition-colors ${focusRing}`}
+                  >
+                    Discard changes
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={saveReview}
+                  disabled={savingReview || !reviewHasChanges}
+                  className={`h-11 px-7 rounded-full bg-[#0f172a] text-[#fdfaf3] font-semibold text-sm hover:bg-[#7a947c] disabled:opacity-40 disabled:cursor-not-allowed transition-colors inline-flex items-center justify-center gap-2 ${focusRing}`}
+                >
+                  {savingReview && <Spinner />}
+                  {savingReview ? "Saving…" : review ? "Update review" : "Save review"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </section>
+
+      {/* ================= Cover photo modal ================= */}
+      {showCoverModal && (
+        <div
+          className="fixed inset-0 z-[60] bg-[#0f172a]/55 backdrop-blur-sm flex items-end sm:items-center justify-center sm:px-5"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) closeCoverModal();
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="cover-modal-title"
+            className="w-full sm:max-w-lg max-h-[94vh] overflow-y-auto bg-[#fdfaf3] border border-[#0f172a]/10 rounded-t-[1.6rem] sm:rounded-[1.6rem] shadow-[0_25px_80px_rgba(15,23,42,0.22)] animate-sheet-in"
+          >
+            <div className="p-6 sm:p-8">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <h2 id="cover-modal-title" className="text-3xl font-classical font-semibold">
+                    {hasCustomCover ? "Change cover photo" : "Add a cover photo"}
+                  </h2>
+                  <p className="text-sm text-slate-500 mt-2 leading-6 font-light">
+                    {book.cover_url
+                      ? "Your photo is kept as a backup and shows whenever the catalogue cover can't load."
+                      : "Photograph your copy so it stands out on your shelf."}
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={closeCoverModal}
+                  disabled={savingCover}
+                  aria-label="Close"
+                  className={`shrink-0 w-10 h-10 rounded-full flex items-center justify-center text-slate-400 hover:text-[#0f172a] hover:bg-[#0f172a]/5 transition-colors disabled:opacity-40 ${focusRing}`}
+                >
+                  <span aria-hidden="true" className="text-2xl leading-none">×</span>
+                </button>
+              </div>
+
+              <div className="mt-7 flex gap-5 items-start">
+                <div className="w-28 sm:w-32 shrink-0">
+                  <div className="relative aspect-[2/3] rounded-xl overflow-hidden shadow-md bg-[#e9e4d9] ring-1 ring-[#0f172a]/10">
+                    <CoverImage sources={modalPreviewSources} title={book.title} author={book.author} />
+                    {coverPreview && (
+                      <span className="absolute top-2 left-2 text-[10px] px-2 py-0.5 rounded-full bg-[#7a947c] text-white shadow">New</span>
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex-1 min-w-0">
+                  <input
+                    ref={coverInputRef}
+                    id="cover-file"
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp"
+                    capture="environment"
+                    className="sr-only"
+                    onChange={(event) => handleCoverFile(event.target.files?.[0])}
+                  />
+
+                  <label
+                    htmlFor="cover-file"
+                    onDragOver={(event) => {
+                      event.preventDefault();
+                      setDragOver(true);
+                    }}
+                    onDragLeave={() => setDragOver(false)}
+                    onDrop={(event) => {
+                      event.preventDefault();
+                      setDragOver(false);
+                      handleCoverFile(event.dataTransfer.files?.[0]);
+                    }}
+                    className={`flex flex-col items-center justify-center gap-2 text-center min-h-[140px] p-4 rounded-2xl border-2 border-dashed cursor-pointer transition-all ${
+                      dragOver ? "border-[#7a947c] bg-[#7a947c]/10" : "border-[#0f172a]/15 bg-white hover:border-[#7a947c] hover:bg-[#7a947c]/5"
+                    }`}
+                  >
+                    <span className="w-10 h-10 rounded-full bg-[#7a947c]/15 text-[#7a947c] flex items-center justify-center" aria-hidden="true">
+                      <CameraIcon size={18} />
+                    </span>
+                    <span className="text-sm font-medium">{coverFile ? "Choose a different image" : "Take a photo or choose an image"}</span>
+                    <span className="text-xs text-slate-400">JPG, PNG or WebP, up to 5 MB</span>
+                  </label>
+
+                  {coverFile && (
+                    <p className="mt-2 text-xs text-slate-500 truncate">
+                      {coverFile.name} · {(coverFile.size / 1024 / 1024).toFixed(1)} MB
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              {coverError && (
+                <div role="alert" className="mt-5 px-4 py-3 rounded-xl bg-[#f8e9e5]/90 border border-[#e8cbc4] text-[#a14e43] text-sm">
+                  {coverError}
+                </div>
+              )}
+
+              <div className="flex flex-col-reverse sm:flex-row sm:items-center gap-3 mt-8">
+                {hasCustomCover && !coverFile && (
+                  <button
+                    type="button"
+                    onClick={removeCustomCover}
+                    disabled={savingCover}
+                    className={`sm:mr-auto text-sm text-slate-400 hover:text-[#a34d43] px-3 py-2 rounded-lg hover:bg-[#f7e9e6] transition-all disabled:opacity-40 ${focusRing}`}
+                  >
+                    Remove my photo
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={closeCoverModal}
+                  disabled={savingCover}
+                  className={`${hasCustomCover && !coverFile ? "" : "sm:ml-auto"} border border-[#0f172a]/12 bg-white/70 text-slate-600 px-6 py-3 rounded-full hover:border-[#0f172a]/30 hover:text-[#0f172a] transition-all text-sm font-semibold disabled:opacity-40 ${focusRing}`}
+                >
+                  Cancel
                 </button>
 
-                {/* ==================================================
-            BOOK HERO
-        ================================================== */}
-
-                <div className="grid lg:grid-cols-[235px_minmax(0,1fr)] xl:grid-cols-[270px_minmax(0,1fr)] gap-8 lg:gap-12 xl:gap-16 items-start">
-                    <div className="w-48 sm:w-56 lg:w-full mx-auto lg:mx-0">
-                        <div className="relative group">
-                            <div className="absolute -inset-4 bg-[#0f172a]/8 rounded-[2rem] blur-2xl opacity-60" />
-
-                            <div className="relative aspect-[2/3] rounded-[1.35rem] overflow-hidden shadow-[0_24px_55px_rgba(15,23,42,0.18)] bg-slate-200 ring-1 ring-[#0f172a]/10">
-                                <CoverImage sources={coverSources} title={book.title} author={book.author} />
-
-                                {/* Change cover control: always visible on touch, reveals on hover for desktop */}
-                                <div className="absolute inset-x-0 bottom-0 p-3 bg-gradient-to-t from-[#0f172a]/70 to-transparent lg:opacity-0 lg:group-hover:opacity-100 lg:focus-within:opacity-100 transition-opacity">
-                                    <button
-                                        type="button"
-                                        onClick={openCoverModal}
-                                        className="w-full inline-flex items-center justify-center gap-2 bg-[#fdfaf3]/95 text-[#0f172a] text-xs font-semibold py-2.5 rounded-full hover:bg-white transition-colors outline-none focus-visible:ring-2 focus-visible:ring-[#7a947c]"
-                                    >
-                                        <CameraIcon />
-                                        {hasCustomCover ? "Change cover photo" : "Add cover photo"}
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div className="lg:pt-2 min-w-0">
-                        <div className="flex flex-wrap items-center gap-2.5 mb-5">
-                            <span className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-[#f7f5fa] text-[#6c5c85] text-xs font-medium border border-[#9a86b9]/20">
-                                <span className="w-1.5 h-1.5 rounded-full bg-[#9a86b9]" />
-                                {STATUS_LABEL[book.status ?? ""] ?? "Want to Read"}
-                            </span>
-
-                            <span className="text-xs text-slate-400">
-                                {journalEntries.length} {journalEntries.length === 1 ? "journal entry" : "journal entries"}
-                            </span>
-
-                            {review && (
-                                <>
-                                    <span className="w-1 h-1 rounded-full bg-slate-300" />
-                                    <span className="text-xs text-[#7a947c]">Review saved</span>
-                                </>
-                            )}
-                        </div>
-
-                        <h1 className="text-[2.7rem] sm:text-5xl md:text-6xl xl:text-[4.4rem] font-classical font-semibold text-[#0f172a] leading-[1.03] max-w-4xl break-words">
-                            {book.title}
-                        </h1>
-
-                        {book.author && (
-                            <p className="text-lg sm:text-xl text-slate-500 mt-5 font-light">
-                                by <span className="text-slate-700">{book.author}</span>
-                            </p>
-                        )}
-
-                        <p className="text-slate-600 mt-5 max-w-2xl leading-7 text-[15px] font-light">
-                            {STATUS_DESCRIPTION[book.status ?? ""] ?? "Part of your personal collection."}{" "}
-                            Keep your thoughts, favourite moments, theories and final impressions together in one place.
-                        </p>
-
-                        {review && review.rating && (
-                            <div className="mt-6 inline-flex flex-wrap items-center gap-3 bg-white/70 border border-[#0f172a]/8 rounded-2xl px-4 py-3">
-                                <div className="flex gap-0.5" aria-label={`Rated ${review.rating} out of 5`}>
-                                    {[1, 2, 3, 4, 5].map((star) => (
-                                        <span
-                                            key={star}
-                                            className={`text-lg ${star <= (review.rating || 0) ? "text-[#c5a24a]" : "text-slate-200"}`}
-                                        >
-                                            ★
-                                        </span>
-                                    ))}
-                                </div>
-
-                                <span className="text-sm font-semibold text-slate-700">{review.rating}/5</span>
-                                <span className="w-px h-4 bg-slate-200" />
-
-                                <button
-                                    type="button"
-                                    onClick={() => setActiveTab("review")}
-                                    className="text-xs font-semibold text-[#7a947c] hover:text-[#0f172a] transition-colors"
-                                >
-                                    View review
-                                </button>
-                            </div>
-                        )}
-
-                        <div className="flex flex-col sm:flex-row gap-3 mt-7">
-                            <button
-                                type="button"
-                                onClick={() => {
-                                    setActiveTab("journal");
-                                    setTimeout(() => {
-                                        document
-                                            .getElementById("journal-composer")
-                                            ?.scrollIntoView({ behavior: "smooth", block: "center" });
-                                    }, 50);
-                                }}
-                                className="inline-flex items-center justify-center gap-2.5 bg-[#7a947c] text-white px-6 py-3.5 rounded-full text-sm font-medium hover:bg-[#6b826c] transition-all shadow-[0_8px_20px_rgba(122,148,124,0.25)]"
-                            >
-                                <span className="text-base">✎</span>
-                                Write a journal entry
-                            </button>
-
-                            <button
-                                type="button"
-                                onClick={() => {
-                                    setActiveTab("review");
-                                    setTimeout(() => {
-                                        document
-                                            .getElementById("review-editor")
-                                            ?.scrollIntoView({ behavior: "smooth", block: "center" });
-                                    }, 50);
-                                }}
-                                className="inline-flex items-center justify-center gap-2.5 bg-white/70 text-slate-700 border border-[#0f172a]/10 px-6 py-3.5 rounded-full text-sm font-medium hover:bg-white hover:text-[#0f172a] transition-all"
-                            >
-                                <span className="text-[#c5a24a]">★</span>
-                                {review ? "Edit your review" : "Write final review"}
-                            </button>
-                        </div>
-                    </div>
-                </div>
-
-                <div className="my-12 md:my-16 flex items-center gap-5">
-                    <div className="h-px flex-1 bg-[#0f172a]/8" />
-                    <div className="font-classical text-[#9a86b9] text-lg">✦</div>
-                    <div className="h-px flex-1 bg-[#0f172a]/8" />
-                </div>
-
-                {/* ==================================================
-            WORKSPACE HEADER
-        ================================================== */}
-
-                <div className="mb-8">
-                    <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-5">
-                        <div>
-                            <h2 className="text-3xl sm:text-4xl font-classical font-semibold text-[#0f172a]">
-                                {activeTab === "journal" ? "Reading Journal" : "Final Review"}
-                            </h2>
-
-                            <p className="text-sm text-slate-500 mt-2 max-w-xl font-light">
-                                {activeTab === "journal"
-                                    ? "Capture thoughts as they come to you while you read."
-                                    : "Bring everything you thought and felt about the book together."}
-                            </p>
-                        </div>
-
-                        <div className="inline-flex self-start sm:self-auto p-1.5 rounded-[1.15rem] bg-white/70 border border-[#0f172a]/8 shadow-sm">
-                            <button
-                                type="button"
-                                onClick={() => setActiveTab("journal")}
-                                className={`flex items-center gap-2 px-4 sm:px-5 py-2.5 rounded-[0.85rem] text-sm font-semibold transition-all ${activeTab === "journal" ? "bg-[#0f172a] text-[#fdfaf3] shadow-md" : "text-slate-500 hover:text-[#0f172a]"
-                                    }`}
-                            >
-                                <span>Journal</span>
-                                <span
-                                    className={`min-w-5 h-5 px-1.5 rounded-full flex items-center justify-center text-[10px] ${activeTab === "journal" ? "bg-white/10 text-white/70" : "bg-slate-100 text-slate-500"
-                                        }`}
-                                >
-                                    {journalEntries.length}
-                                </span>
-                            </button>
-
-                            <button
-                                type="button"
-                                onClick={() => setActiveTab("review")}
-                                className={`flex items-center gap-2 px-4 sm:px-5 py-2.5 rounded-[0.85rem] text-sm font-semibold transition-all ${activeTab === "review" ? "bg-[#0f172a] text-[#fdfaf3] shadow-md" : "text-slate-500 hover:text-[#0f172a]"
-                                    }`}
-                            >
-                                <span>Review</span>
-                                {review && (
-                                    <span
-                                        className={`min-w-5 h-5 rounded-full flex items-center justify-center text-[10px] ${activeTab === "review" ? "bg-[#7a947c] text-white" : "bg-[#eaf0ea] text-[#5c7a5e]"
-                                            }`}
-                                    >
-                                        ✓
-                                    </span>
-                                )}
-                            </button>
-                        </div>
-                    </div>
-                </div>
-
-                {error && (
-                    <div className="mb-8 flex items-start gap-3 px-5 py-4 rounded-2xl bg-[#f8e9e5]/90 border border-[#e8cbc4] text-[#a14e43] text-sm">
-                        <span className="w-6 h-6 rounded-full bg-[#efd5d0] flex items-center justify-center flex-shrink-0 font-semibold">
-                            !
-                        </span>
-                        <p className="leading-6 flex-1">{error}</p>
-                        <button
-                            type="button"
-                            onClick={() => setError("")}
-                            className="text-[#bb7c72] hover:text-[#8d3e35] text-lg leading-none"
-                            aria-label="Dismiss error"
-                        >
-                            ×
-                        </button>
-                    </div>
-                )}
-
-                {/* ==================================================
-            JOURNAL
-        ================================================== */}
-
-                {activeTab === "journal" && (
-                    <div className="grid lg:grid-cols-[340px_minmax(0,1fr)] xl:grid-cols-[365px_minmax(0,1fr)] gap-8 lg:gap-10 items-start">
-                        <div id="journal-composer" className="lg:sticky lg:top-24 scroll-mt-24">
-                            <div className="soft-surface rounded-[1.6rem] border soft-border shadow-[0_15px_45px_rgba(15,23,42,0.06)] overflow-hidden">
-                                <div className="p-6 sm:p-7">
-                                    <div className="flex items-start justify-between gap-4 mb-5">
-                                        <div>
-                                            <h2 className="text-2xl sm:text-[1.7rem] font-classical font-semibold text-[#0f172a]">
-                                                What are you thinking?
-                                            </h2>
-                                        </div>
-
-                                        <div className="w-10 h-10 rounded-full bg-[#f0f4f1] flex items-center justify-center flex-shrink-0">
-                                            <span className="text-lg text-[#7a947c]">✎</span>
-                                        </div>
-                                    </div>
-
-                                    <p className="text-sm text-slate-500 leading-6 mb-7 font-light">
-                                        Capture the little things you don&apos;t want to forget while you&apos;re reading.
-                                    </p>
-
-                                    <label htmlFor="journal-date" className="block text-sm font-medium text-slate-600 mb-2.5">
-                                        Entry date
-                                    </label>
-
-                                    <input
-                                        id="journal-date"
-                                        type="date"
-                                        value={journalDate}
-                                        onChange={(event) => setJournalDate(event.target.value)}
-                                        className="w-full h-12 px-4 bg-white border border-[#0f172a]/10 rounded-xl text-sm text-slate-700 focus:outline-none focus:border-[#7a947c] focus:ring-4 focus:ring-[#7a947c]/10 transition-all"
-                                    />
-
-                                    <div className="mt-5">
-                                        <div className="flex items-center justify-between mb-2.5">
-                                            <label htmlFor="journal" className="text-sm font-medium text-slate-600">
-                                                Your thoughts
-                                            </label>
-                                            <span className="text-xs text-slate-400">{journalText.length}</span>
-                                        </div>
-
-                                        <textarea
-                                            id="journal"
-                                            value={journalText}
-                                            onChange={(event) => setJournalText(event.target.value)}
-                                            placeholder="A favourite moment, a theory, something that surprised you..."
-                                            rows={9}
-                                            className="journal-paper w-full px-4 border border-[#0f172a]/10 rounded-xl resize-none text-sm text-slate-600 placeholder:text-slate-300 focus:outline-none focus:border-[#7a947c] focus:ring-4 focus:ring-[#7a947c]/10 transition-all"
-                                        />
-                                    </div>
-
-                                    <button
-                                        type="button"
-                                        onClick={saveJournalEntry}
-                                        disabled={savingJournal || !journalText.trim()}
-                                        className="w-full mt-5 bg-[#7a947c] text-white py-3.5 rounded-full font-semibold text-sm hover:bg-[#6b826c] disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-[0_8px_20px_rgba(122,148,124,0.2)]"
-                                    >
-                                        {savingJournal ? "Saving entry..." : "Save Journal Entry"}
-                                    </button>
-                                </div>
-
-                                <div className="px-6 sm:px-7 py-4 bg-[#f7f5fa]/70 border-t border-[#0f172a]/6">
-                                    <p className="text-xs text-slate-400 leading-5">
-                                        Your journal is private to your account and tied to this book.
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div>
-                            <div className="flex items-end justify-between gap-5 mb-6">
-                                <h2 className="text-3xl sm:text-4xl font-classical font-semibold text-[#0f172a]">
-                                    Your entries
-                                </h2>
-                                <span className="text-xs text-slate-400 pb-1">
-                                    {journalEntries.length} {journalEntries.length === 1 ? "entry" : "entries"}
-                                </span>
-                            </div>
-
-                            {journalEntries.length === 0 ? (
-                                <div className="soft-surface border border-dashed border-[#0f172a]/12 rounded-[1.6rem] p-10 sm:p-14 text-center">
-                                    <div className="w-16 h-16 mx-auto rounded-full bg-[#f7f5fa] flex items-center justify-center mb-5">
-                                        <span className="font-classical text-2xl text-[#9a86b9]">A</span>
-                                    </div>
-
-                                    <h3 className="font-classical text-2xl font-semibold text-[#0f172a]">
-                                        Your story starts here.
-                                    </h3>
-
-                                    <p className="text-sm text-slate-400 mt-2 max-w-sm mx-auto leading-6 font-light">
-                                        Your reading thoughts will appear here as you add them.
-                                    </p>
-
-                                    <button
-                                        type="button"
-                                        onClick={() =>
-                                            document.getElementById("journal")?.scrollIntoView({ behavior: "smooth", block: "center" })
-                                        }
-                                        className="mt-6 text-sm font-semibold text-[#7a947c] hover:text-[#0f172a] transition-colors"
-                                    >
-                                        Start writing →
-                                    </button>
-                                </div>
-                            ) : (
-                                <div className="relative">
-                                    <div className="absolute left-[18px] top-5 bottom-5 w-px bg-[#0f172a]/10 hidden sm:block" />
-
-                                    <div className="space-y-7">
-                                        {journalEntries.map((entry) => (
-                                            <article key={entry.id} className="relative sm:pl-12">
-                                                <div className="hidden sm:flex absolute left-0 top-5 w-9 h-9 rounded-full bg-[#fdfaf3] border border-[#0f172a]/10 items-center justify-center z-10">
-                                                    <div className="w-2.5 h-2.5 rounded-full bg-[#7a947c]" />
-                                                </div>
-
-                                                <div className="soft-surface border soft-border rounded-[1.5rem] shadow-[0_8px_30px_rgba(15,23,42,0.04)] hover:shadow-[0_12px_35px_rgba(15,23,42,0.07)] transition-shadow overflow-hidden">
-                                                    <div className="px-6 sm:px-7 pt-6 pb-4 flex items-start justify-between gap-5">
-                                                        <div className="flex items-center gap-3">
-                                                            <div className="sm:hidden w-10 h-10 rounded-xl bg-[#f7f5fa] flex flex-col items-center justify-center flex-shrink-0">
-                                                                <span className="text-[9px] uppercase tracking-wider text-[#9a86b9] font-bold">
-                                                                    {formatEntryDate(entry.entry_date, "month")}
-                                                                </span>
-                                                                <span className="text-sm font-classical text-[#0f172a] leading-none">
-                                                                    {formatEntryDate(entry.entry_date, "day")}
-                                                                </span>
-                                                            </div>
-
-                                                            <div>
-                                                                <p className="text-sm font-semibold text-[#7a947c]">
-                                                                    {formatEntryDate(entry.entry_date, "short")}
-                                                                </p>
-                                                                <p className="text-xs text-slate-400 mt-1">
-                                                                    {formatEntryDate(entry.entry_date, "long")}
-                                                                </p>
-                                                            </div>
-                                                        </div>
-
-                                                        <button
-                                                            type="button"
-                                                            onClick={() => deleteJournalEntry(entry.id)}
-                                                            className="text-xs text-slate-400 hover:text-[#a34d43] px-2.5 py-1.5 rounded-lg hover:bg-[#f7e9e6] transition-all"
-                                                        >
-                                                            Delete
-                                                        </button>
-                                                    </div>
-
-                                                    <div className="px-6 sm:px-7 pb-7">
-                                                        <div className="h-px bg-[#0f172a]/6 mb-5" />
-                                                        <p className="text-slate-600 leading-8 whitespace-pre-wrap text-[15px] font-light">
-                                                            {entry.content}
-                                                        </p>
-                                                    </div>
-                                                </div>
-                                            </article>
-                                        ))}
-                                    </div>
-                                </div>
-                            )}
-                        </div>
-                    </div>
-                )}
-
-                {/* ==================================================
-            FINAL REVIEW
-        ================================================== */}
-
-                {activeTab === "review" && (
-                    <div id="review-editor" className="max-w-4xl scroll-mt-24">
-                        <div className="mb-8">
-                            {reviewHasChanges && (
-                                <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#a47a25] bg-[#f6ecd4]/70 px-2.5 py-1 rounded-full mb-3">
-                                    <span className="w-1.5 h-1.5 rounded-full bg-[#c69a3d]" />
-                                    Unsaved changes
-                                </span>
-                            )}
-
-                            <h2 className="text-4xl sm:text-5xl font-classical font-semibold text-[#0f172a] leading-tight">
-                                {review ? "Your thoughts on the book" : "What did you think?"}
-                            </h2>
-
-                            <p className="text-slate-600 mt-4 leading-7 max-w-2xl text-[15px] font-light">
-                                Bring together everything you felt, noticed and thought about while reading.
-                            </p>
-                        </div>
-
-                        <div className="soft-surface rounded-[1.6rem] border soft-border shadow-[0_10px_35px_rgba(15,23,42,0.05)] p-6 sm:p-8 mb-5">
-                            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                                <div>
-                                    <p className="text-sm font-medium text-slate-600">Your rating</p>
-                                    <p className="text-sm text-slate-400 mt-1 font-light">How would you rate this book?</p>
-                                </div>
-
-                                <div className="sm:text-right">
-                                    {displayRating > 0 ? (
-                                        <>
-                                            <p className="text-sm font-semibold text-slate-700">{displayRating}/5</p>
-                                            <p className="text-xs text-[#7a947c] mt-0.5">{RATING_LABEL[displayRating]}</p>
-                                        </>
-                                    ) : (
-                                        <p className="text-xs text-slate-300">Choose a rating below</p>
-                                    )}
-                                </div>
-                            </div>
-
-                            <div className="flex items-center gap-1.5 mt-6" onMouseLeave={() => setHoveredRating(0)}>
-                                {[1, 2, 3, 4, 5].map((star) => (
-                                    <button
-                                        key={star}
-                                        type="button"
-                                        onClick={() => setRating(star)}
-                                        onMouseEnter={() => setHoveredRating(star)}
-                                        aria-label={`Rate ${star} out of 5`}
-                                        className={`w-12 h-12 sm:w-14 sm:h-14 rounded-xl flex items-center justify-center text-3xl sm:text-4xl transition-all ${star <= displayRating
-                                            ? "text-[#c5a24a] bg-[#c5a24a]/10 scale-105"
-                                            : "text-slate-200 hover:text-[#c5a24a]/60 hover:bg-[#f7f5fa]"
-                                            }`}
-                                    >
-                                        ★
-                                    </button>
-                                ))}
-                            </div>
-                        </div>
-
-                        <div className="soft-surface rounded-[1.6rem] border soft-border shadow-[0_10px_35px_rgba(15,23,42,0.05)] overflow-hidden">
-                            <div className="p-6 sm:p-8">
-                                <div className="flex items-center justify-between mb-4">
-                                    <label htmlFor="review" className="text-sm font-medium text-slate-600">
-                                        Your review
-                                    </label>
-                                    <span className="text-xs text-slate-400">{reviewText.length} characters</span>
-                                </div>
-
-                                <textarea
-                                    id="review"
-                                    value={reviewText}
-                                    onChange={(event) => setReviewText(event.target.value)}
-                                    placeholder="Write about the story, characters, writing, themes, favourite moments, or anything else that stayed with you..."
-                                    rows={14}
-                                    className="journal-paper journal-paper--lg w-full px-5 border border-[#0f172a]/10 rounded-2xl resize-y min-h-[300px] text-[15px] text-slate-600 placeholder:text-slate-300 focus:outline-none focus:border-[#7a947c] focus:ring-4 focus:ring-[#7a947c]/10 transition-all"
-                                />
-
-                                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mt-5">
-                                    <p className="text-xs text-slate-400 font-light">
-                                        {review
-                                            ? "You can edit your review at any time."
-                                            : "Your review will be saved privately to your account."}
-                                    </p>
-
-                                    <button
-                                        type="button"
-                                        onClick={saveReview}
-                                        disabled={savingReview || rating === 0 || !reviewText.trim() || !reviewHasChanges}
-                                        className="w-full sm:w-auto bg-[#0f172a] text-[#fdfaf3] px-8 py-3.5 rounded-full font-semibold text-sm hover:bg-[#1e293b] disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-[0_8px_20px_rgba(15,23,42,0.12)]"
-                                    >
-                                        {savingReview ? "Saving review..." : review ? "Update Review" : "Save Review"}
-                                    </button>
-                                </div>
-                            </div>
-
-                            <div className="px-6 sm:px-8 py-4 bg-[#f7f5fa]/70 border-t border-[#0f172a]/6">
-                                <div className="flex items-center gap-2">
-                                    <span className="w-1.5 h-1.5 rounded-full bg-[#7a947c]" />
-                                    <p className="text-xs text-slate-400 leading-5">
-                                        Your review is private and only visible in your personal library.
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                )}
-            </section>
-
-            {/* ==================================================
-          COVER PHOTO MODAL
-      ================================================== */}
-
-            {showCoverModal && (
-                <div
-                    className="fixed inset-0 z-[60] bg-[#0f172a]/55 backdrop-blur-sm flex items-end sm:items-center justify-center sm:px-5"
-                    onMouseDown={(event) => {
-                        if (event.target === event.currentTarget) closeCoverModal();
-                    }}
+                <button
+                  type="button"
+                  onClick={saveCustomCover}
+                  disabled={!coverFile || savingCover}
+                  className={`bg-[#7a947c] text-white px-7 py-3 rounded-full hover:bg-[#6b826c] transition-all text-sm font-semibold disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center justify-center gap-2 ${focusRing}`}
                 >
-                    <div
-                        role="dialog"
-                        aria-modal="true"
-                        aria-labelledby="cover-modal-title"
-                        className="w-full sm:max-w-lg max-h-[94vh] overflow-y-auto bg-[#fdfaf3] border border-[#0f172a]/10 rounded-t-[1.6rem] sm:rounded-[1.6rem] shadow-[0_25px_80px_rgba(15,23,42,0.22)] animate-sheet-in"
-                    >
-                        <div className="p-6 sm:p-8">
-                            <div className="flex items-start justify-between gap-4">
-                                <div>
-                                    <h2 id="cover-modal-title" className="text-3xl font-classical font-semibold text-[#0f172a]">
-                                        {hasCustomCover ? "Change cover photo" : "Add a cover photo"}
-                                    </h2>
-                                    <p className="text-sm text-slate-500 mt-2 leading-6 font-light">
-                                        {book.cover_url
-                                            ? "Your photo is kept as a backup and shows whenever the catalogue cover can't load."
-                                            : "Photograph your copy so it stands out on your shelf."}
-                                    </p>
-                                </div>
+                  {savingCover && <Spinner />}
+                  {savingCover ? "Saving…" : "Save cover"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
-                                <button
-                                    type="button"
-                                    onClick={closeCoverModal}
-                                    disabled={savingCover}
-                                    aria-label="Close"
-                                    className="shrink-0 w-10 h-10 rounded-full flex items-center justify-center text-slate-400 hover:text-[#0f172a] hover:bg-[#0f172a]/5 transition-colors disabled:opacity-40"
-                                >
-                                    <span aria-hidden="true" className="text-2xl leading-none">×</span>
-                                </button>
-                            </div>
+      {/* ================= Unsaved changes modal ================= */}
+      {showLeaveModal && (
+        <div
+          className="fixed inset-0 z-[60] bg-[#0f172a]/55 backdrop-blur-sm flex items-center justify-center px-5"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setShowLeaveModal(false);
+              setPendingDestination(null);
+            }
+          }}
+        >
+          <div
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="leave-title"
+            className="w-full max-w-md bg-[#fdfaf3] border border-[#0f172a]/10 rounded-[1.6rem] shadow-[0_25px_80px_rgba(15,23,42,0.22)] p-7 sm:p-8"
+          >
+            <h2 id="leave-title" className="text-3xl font-classical font-semibold">
+              Leave without saving?
+            </h2>
 
-                            <div className="mt-7 flex gap-5 items-start">
-                                {/* Preview */}
-                                <div className="w-28 sm:w-32 shrink-0">
-                                    <div className="relative aspect-[2/3] rounded-xl overflow-hidden shadow-md bg-[#e9e4d9] ring-1 ring-[#0f172a]/10">
-                                        <CoverImage sources={modalPreviewSources} title={book.title} author={book.author} />
-                                        {coverPreview && (
-                                            <span className="absolute top-2 left-2 text-[10px] px-2 py-0.5 rounded-full bg-[#7a947c] text-white shadow">
-                                                New
-                                            </span>
-                                        )}
-                                    </div>
-                                </div>
+            <p className="text-slate-600 mt-4 leading-7 text-sm font-light">
+              {[
+                journalHasDraft && "an unsaved note",
+                editingId !== null && "a note you're editing",
+                reviewHasChanges && "review changes",
+              ]
+                .filter(Boolean)
+                .join(", ")
+                .replace(/^./, (c) => c.toUpperCase())}{" "}
+              will be lost if you leave now.
+            </p>
 
-                                {/* Picker */}
-                                <div className="flex-1 min-w-0">
-                                    <input
-                                        ref={coverInputRef}
-                                        id="cover-file"
-                                        type="file"
-                                        accept="image/jpeg,image/png,image/webp"
-                                        capture="environment"
-                                        className="sr-only"
-                                        onChange={(event) => handleCoverFile(event.target.files?.[0])}
-                                    />
+            <div className="flex flex-col-reverse sm:flex-row gap-3 mt-8">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowLeaveModal(false);
+                  setPendingDestination(null);
+                }}
+                className={`flex-1 border border-[#0f172a]/12 bg-white/70 text-slate-600 py-3.5 rounded-full hover:border-[#0f172a]/30 hover:text-[#0f172a] transition-all text-sm font-semibold ${focusRing}`}
+              >
+                Keep editing
+              </button>
 
-                                    <label
-                                        htmlFor="cover-file"
-                                        onDragOver={(event) => {
-                                            event.preventDefault();
-                                            setDragOver(true);
-                                        }}
-                                        onDragLeave={() => setDragOver(false)}
-                                        onDrop={(event) => {
-                                            event.preventDefault();
-                                            setDragOver(false);
-                                            handleCoverFile(event.dataTransfer.files?.[0]);
-                                        }}
-                                        className={`flex flex-col items-center justify-center gap-2 text-center min-h-[140px] p-4 rounded-2xl border-2 border-dashed cursor-pointer transition-all ${dragOver
-                                            ? "border-[#7a947c] bg-[#7a947c]/10"
-                                            : "border-[#0f172a]/15 bg-white hover:border-[#7a947c] hover:bg-[#7a947c]/5"
-                                            }`}
-                                    >
-                                        <span className="w-10 h-10 rounded-full bg-[#7a947c]/15 text-[#7a947c] flex items-center justify-center" aria-hidden="true">
-                                            <CameraIcon size={18} />
-                                        </span>
-                                        <span className="text-sm font-medium text-[#0f172a]">
-                                            {coverFile ? "Choose a different image" : "Take a photo or choose an image"}
-                                        </span>
-                                        <span className="text-xs text-slate-400">JPG, PNG or WebP, up to 5 MB</span>
-                                    </label>
-
-                                    {coverFile && (
-                                        <p className="mt-2 text-xs text-slate-500 truncate">
-                                            {coverFile.name} · {(coverFile.size / 1024 / 1024).toFixed(1)} MB
-                                        </p>
-                                    )}
-                                </div>
-                            </div>
-
-                            {coverError && (
-                                <div role="alert" className="mt-5 px-4 py-3 rounded-xl bg-[#f8e9e5]/90 border border-[#e8cbc4] text-[#a14e43] text-sm">
-                                    {coverError}
-                                </div>
-                            )}
-
-                            <div className="flex flex-col-reverse sm:flex-row sm:items-center gap-3 mt-8">
-                                {hasCustomCover && !coverFile && (
-                                    <button
-                                        type="button"
-                                        onClick={removeCustomCover}
-                                        disabled={savingCover}
-                                        className="sm:mr-auto text-sm text-slate-400 hover:text-[#a34d43] px-3 py-2 rounded-lg hover:bg-[#f7e9e6] transition-all disabled:opacity-40"
-                                    >
-                                        Remove my photo
-                                    </button>
-                                )}
-
-                                <button
-                                    type="button"
-                                    onClick={closeCoverModal}
-                                    disabled={savingCover}
-                                    className={`${hasCustomCover && !coverFile ? "" : "sm:ml-auto"} border border-[#0f172a]/12 bg-white/70 text-slate-600 px-6 py-3 rounded-full hover:border-[#0f172a]/30 hover:text-[#0f172a] transition-all text-sm font-semibold disabled:opacity-40`}
-                                >
-                                    Cancel
-                                </button>
-
-                                <button
-                                    type="button"
-                                    onClick={saveCustomCover}
-                                    disabled={!coverFile || savingCover}
-                                    className="bg-[#7a947c] text-white px-7 py-3 rounded-full hover:bg-[#6b826c] transition-all text-sm font-semibold disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center justify-center gap-2"
-                                >
-                                    {savingCover && (
-                                        <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                                    )}
-                                    {savingCover ? "Saving…" : "Save cover"}
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            )}
-
-            {/* ==================================================
-          UNSAVED CHANGES MODAL
-      ================================================== */}
-
-            {showLeaveModal && (
-                <div
-                    className="fixed inset-0 z-[60] bg-[#0f172a]/55 backdrop-blur-sm flex items-center justify-center px-5"
-                    onMouseDown={(event) => {
-                        if (event.target === event.currentTarget) {
-                            setShowLeaveModal(false);
-                            setPendingDestination(null);
-                        }
-                    }}
-                >
-                    <div className="w-full max-w-md bg-[#fdfaf3] border border-[#0f172a]/10 rounded-[1.6rem] shadow-[0_25px_80px_rgba(15,23,42,0.22)] overflow-hidden">
-                        <div className="p-7 sm:p-8">
-                            <div className="w-12 h-12 rounded-full bg-[#f7f5fa] flex items-center justify-center mb-5">
-                                <span className="text-xl text-[#9a86b9]">✎</span>
-                            </div>
-
-                            <h2 className="text-3xl font-classical font-semibold text-[#0f172a] mt-2">
-                                Leave without saving?
-                            </h2>
-
-                            <p className="text-slate-600 mt-4 leading-7 text-sm font-light">
-                                You have made changes to your review that haven&apos;t been saved yet. If you leave this
-                                page, those changes will be lost.
-                            </p>
-
-                            <div className="flex flex-col-reverse sm:flex-row gap-3 mt-8">
-                                <button
-                                    type="button"
-                                    onClick={() => {
-                                        setShowLeaveModal(false);
-                                        setPendingDestination(null);
-                                    }}
-                                    className="flex-1 border border-[#0f172a]/12 bg-white/70 text-slate-600 py-3.5 rounded-full hover:border-[#0f172a]/30 hover:text-[#0f172a] transition-all text-sm font-semibold"
-                                >
-                                    Continue Editing
-                                </button>
-
-                                <button
-                                    type="button"
-                                    onClick={discardAndLeave}
-                                    className="flex-1 bg-[#0f172a] text-[#fdfaf3] py-3.5 rounded-full hover:bg-[#1e293b] transition-all text-sm font-semibold"
-                                >
-                                    Discard & Leave
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            )}
-        </main>
-    );
+              <button
+                type="button"
+                onClick={discardAndLeave}
+                className={`flex-1 bg-[#0f172a] text-[#fdfaf3] py-3.5 rounded-full hover:bg-[#1e293b] transition-all text-sm font-semibold ${focusRing}`}
+              >
+                Discard and leave
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </main>
+  );
 }
 
 function CameraIcon({ size = 14 }: { size?: number }) {
-    return (
-        <svg
-            aria-hidden="true"
-            width={size}
-            height={size}
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.8"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-        >
-            <path d="M4 7h3l2-3h6l2 3h3v12H4z" />
-            <circle cx="12" cy="13" r="3.5" />
-        </svg>
-    );
+  return (
+    <svg aria-hidden="true" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 7h3l2-3h6l2 3h3v12H4z" />
+      <circle cx="12" cy="13" r="3.5" />
+    </svg>
+  );
 }
