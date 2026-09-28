@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -31,13 +31,77 @@ const NAV_LINKS = [
 // Palette (unchanged)
 // navy  #0f172a  | cream #Fdfaf3 | sage #7a947c
 
+// --------------------------------------------------
+// Shared auth status
+//
+// Lives at module scope, so it survives page navigations. The first
+// page load resolves it once; every Navbar mounted after that starts
+// with the known status and never flashes the signed-out view.
+// --------------------------------------------------
+
+type AuthStatus = "unknown" | "signed-in" | "signed-out";
+
+let authStatus: AuthStatus = "unknown";
+let watcherStarted = false;
+const subscribers = new Set<() => void>();
+
+function setAuthStatus(next: AuthStatus) {
+    if (authStatus === next) return;
+    authStatus = next;
+    subscribers.forEach((notify) => notify());
+}
+
+function startAuthWatcher() {
+    if (watcherStarted || typeof window === "undefined") return;
+    watcherStarted = true;
+
+    supabase.auth.getSession().then(({ data }) => {
+        setAuthStatus(data.session ? "signed-in" : "signed-out");
+    });
+
+    supabase.auth.onAuthStateChange((_event, session) => {
+        setAuthStatus(session ? "signed-in" : "signed-out");
+    });
+}
+
+function subscribe(notify: () => void) {
+    startAuthWatcher();
+    subscribers.add(notify);
+    return () => {
+        subscribers.delete(notify);
+    };
+}
+
+const getSnapshot = () => authStatus;
+const getServerSnapshot = (): AuthStatus => "unknown";
+
+/**
+ * `hint` lets a page that already knows the user is signed in skip the
+ * brief "unknown" state. A false hint is ignored, because pages pass
+ * false while they are still loading.
+ */
+function useAuthStatus(hint?: boolean): AuthStatus {
+    const status = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
+    if (status === "unknown" && hint) return "signed-in";
+    return status;
+}
+
+// --------------------------------------------------
+// Component
+// --------------------------------------------------
+
 interface NavbarProps {
+    /** Optional. Navbar resolves auth itself; `true` only skips the placeholder. */
     isLoggedIn?: boolean;
 }
 
-export default function Navbar({ isLoggedIn = false }: NavbarProps) {
+export default function Navbar({ isLoggedIn }: NavbarProps) {
     const router = useRouter();
     const pathname = usePathname();
+
+    const status = useAuthStatus(isLoggedIn);
+    const signedIn = status === "signed-in";
+    const resolving = status === "unknown";
 
     const [menuOpen, setMenuOpen] = useState(false);
     const [scrolled, setScrolled] = useState(false);
@@ -66,12 +130,13 @@ export default function Navbar({ isLoggedIn = false }: NavbarProps) {
         const { error } = await supabase.auth.signOut();
 
         if (error) {
-            console.error("Logout error:", error);
+            console.error("Logout error:", error.message);
             setLogoutError("Sign out failed. Try again.");
             setLoggingOut(false);
             return;
         }
 
+        setAuthStatus("signed-out");
         setMenuOpen(false);
         setLoggingOut(false);
         router.replace("/login");
@@ -90,7 +155,7 @@ export default function Navbar({ isLoggedIn = false }: NavbarProps) {
     // --------------------------------------------------
 
     useEffect(() => {
-        if (!isLoggedIn) return;
+        if (!signedIn) return;
 
         const startTimer = () => {
             if (inactivityTimerRef.current) {
@@ -123,7 +188,7 @@ export default function Navbar({ isLoggedIn = false }: NavbarProps) {
                 window.removeEventListener(event, onActivity)
             );
         };
-    }, [isLoggedIn]);
+    }, [signedIn]);
 
     // --------------------------------------------------
     // Scroll state for sticky bar styling
@@ -182,6 +247,7 @@ export default function Navbar({ isLoggedIn = false }: NavbarProps) {
         >
             <nav
                 aria-label="Main"
+                aria-busy={resolving || undefined}
                 className={`max-w-6xl mx-auto px-5 sm:px-8 transition-[padding] duration-300 ${
                     scrolled ? "py-3 sm:py-4" : "py-5 sm:py-7"
                 }`}
@@ -208,7 +274,22 @@ export default function Navbar({ isLoggedIn = false }: NavbarProps) {
                     </Link>
 
                     {/* Desktop navigation */}
-                    {isLoggedIn ? (
+                    {resolving ? (
+                        // Placeholder with the same footprint as the signed-in bar,
+                        // so nothing jumps when the real links appear.
+                        <div aria-hidden="true" className="hidden md:flex items-center gap-1 lg:gap-2">
+                            {[88, 64, 96, 56].map((width) => (
+                                <span
+                                    key={width}
+                                    className="mx-3 h-3.5 rounded-full bg-[#0f172a]/[0.07] animate-pulse"
+                                    style={{ width }}
+                                />
+                            ))}
+                            <span className="mx-3 h-6 w-px bg-[#0f172a]/10" />
+                            <span className="w-10 h-10 rounded-full bg-[#0f172a]/[0.07] animate-pulse" />
+                            <span className="ml-2 w-[86px] h-9 rounded-full bg-[#0f172a]/[0.07] animate-pulse" />
+                        </div>
+                    ) : signedIn ? (
                         <div className="hidden md:flex items-center gap-1 lg:gap-2">
                             <ul className="flex items-center gap-1 lg:gap-2">
                                 {NAV_LINKS.map(({ href, label }) => {
@@ -271,32 +352,39 @@ export default function Navbar({ isLoggedIn = false }: NavbarProps) {
                     )}
 
                     {/* Mobile menu button */}
-                    <button
-                        type="button"
-                        onClick={() => setMenuOpen((open) => !open)}
-                        aria-label={menuOpen ? "Close navigation menu" : "Open navigation menu"}
-                        aria-expanded={menuOpen}
-                        aria-controls="mobile-nav"
-                        className={`md:hidden relative w-11 h-11 rounded-full border border-[#0f172a]/15 bg-white flex items-center justify-center text-[#0f172a] hover:border-[#7a947c] transition-colors ${focusRing}`}
-                    >
-                        <span aria-hidden="true" className="relative block w-5 h-3.5">
-                            <span
-                                className={`absolute left-0 w-5 h-px bg-[#0f172a] transition-all duration-300 ${
-                                    menuOpen ? "top-1/2 rotate-45" : "top-0"
-                                }`}
-                            />
-                            <span
-                                className={`absolute left-0 top-1/2 w-5 h-px bg-[#0f172a] transition-opacity duration-200 ${
-                                    menuOpen ? "opacity-0" : "opacity-100"
-                                }`}
-                            />
-                            <span
-                                className={`absolute left-0 w-5 h-px bg-[#0f172a] transition-all duration-300 ${
-                                    menuOpen ? "top-1/2 -rotate-45" : "top-full"
-                                }`}
-                            />
-                        </span>
-                    </button>
+                    {resolving ? (
+                        <span
+                            aria-hidden="true"
+                            className="md:hidden w-11 h-11 rounded-full bg-[#0f172a]/[0.07] animate-pulse"
+                        />
+                    ) : (
+                        <button
+                            type="button"
+                            onClick={() => setMenuOpen((open) => !open)}
+                            aria-label={menuOpen ? "Close navigation menu" : "Open navigation menu"}
+                            aria-expanded={menuOpen}
+                            aria-controls="mobile-nav"
+                            className={`md:hidden relative w-11 h-11 rounded-full border border-[#0f172a]/15 bg-white flex items-center justify-center text-[#0f172a] hover:border-[#7a947c] transition-colors ${focusRing}`}
+                        >
+                            <span aria-hidden="true" className="relative block w-5 h-3.5">
+                                <span
+                                    className={`absolute left-0 w-5 h-px bg-[#0f172a] transition-all duration-300 ${
+                                        menuOpen ? "top-1/2 rotate-45" : "top-0"
+                                    }`}
+                                />
+                                <span
+                                    className={`absolute left-0 top-1/2 w-5 h-px bg-[#0f172a] transition-opacity duration-200 ${
+                                        menuOpen ? "opacity-0" : "opacity-100"
+                                    }`}
+                                />
+                                <span
+                                    className={`absolute left-0 w-5 h-px bg-[#0f172a] transition-all duration-300 ${
+                                        menuOpen ? "top-1/2 -rotate-45" : "top-full"
+                                    }`}
+                                />
+                            </span>
+                        </button>
+                    )}
                 </div>
 
                 {logoutError && (
@@ -306,72 +394,74 @@ export default function Navbar({ isLoggedIn = false }: NavbarProps) {
                 )}
 
                 {/* Mobile navigation */}
-                <div
-                    id="mobile-nav"
-                    className={`md:hidden grid transition-[grid-template-rows,opacity] duration-300 ease-out ${
-                        menuOpen
-                            ? "grid-rows-[1fr] opacity-100 mt-4"
-                            : "grid-rows-[0fr] opacity-0 pointer-events-none"
-                    }`}
-                    inert={!menuOpen ? true : undefined}
-                >
-                    <div className="overflow-hidden">
-                        <div className="bg-white rounded-2xl border border-[#0f172a]/5 shadow-lg p-2">
-                            {isLoggedIn ? (
-                                <ul className="flex flex-col">
-                                    {[...NAV_LINKS, { href: "/profile", label: "Profile" }].map(
-                                        ({ href, label }) => {
-                                            const active = isActive(href);
-                                            return (
-                                                <li key={href}>
-                                                    <Link
-                                                        href={href}
-                                                        onClick={closeMenu}
-                                                        aria-current={active ? "page" : undefined}
-                                                        className={`flex items-center gap-3 px-4 py-3.5 rounded-xl font-medium transition-colors ${focusRing} ${
-                                                            active
-                                                                ? "bg-[#Fdfaf3] text-[#0f172a]"
-                                                                : "text-[#0f172a]/80 hover:bg-[#Fdfaf3] hover:text-[#7a947c]"
-                                                        }`}
-                                                    >
-                                                        <span
-                                                            aria-hidden="true"
-                                                            className={`w-1 h-5 rounded-full transition-colors ${
-                                                                active ? "bg-[#7a947c]" : "bg-transparent"
+                {!resolving && (
+                    <div
+                        id="mobile-nav"
+                        className={`md:hidden grid transition-[grid-template-rows,opacity] duration-300 ease-out ${
+                            menuOpen
+                                ? "grid-rows-[1fr] opacity-100 mt-4"
+                                : "grid-rows-[0fr] opacity-0 pointer-events-none"
+                        }`}
+                        inert={!menuOpen ? true : undefined}
+                    >
+                        <div className="overflow-hidden">
+                            <div className="bg-white rounded-2xl border border-[#0f172a]/5 shadow-lg p-2">
+                                {signedIn ? (
+                                    <ul className="flex flex-col">
+                                        {[...NAV_LINKS, { href: "/profile", label: "Profile" }].map(
+                                            ({ href, label }) => {
+                                                const active = isActive(href);
+                                                return (
+                                                    <li key={href}>
+                                                        <Link
+                                                            href={href}
+                                                            onClick={closeMenu}
+                                                            aria-current={active ? "page" : undefined}
+                                                            className={`flex items-center gap-3 px-4 py-3.5 rounded-xl font-medium transition-colors ${focusRing} ${
+                                                                active
+                                                                    ? "bg-[#Fdfaf3] text-[#0f172a]"
+                                                                    : "text-[#0f172a]/80 hover:bg-[#Fdfaf3] hover:text-[#7a947c]"
                                                             }`}
-                                                        />
-                                                        {label}
-                                                    </Link>
-                                                </li>
-                                            );
-                                        }
-                                    )}
+                                                        >
+                                                            <span
+                                                                aria-hidden="true"
+                                                                className={`w-1 h-5 rounded-full transition-colors ${
+                                                                    active ? "bg-[#7a947c]" : "bg-transparent"
+                                                                }`}
+                                                            />
+                                                            {label}
+                                                        </Link>
+                                                    </li>
+                                                );
+                                            }
+                                        )}
 
-                                    <li aria-hidden="true" className="h-px bg-[#0f172a]/5 my-2 mx-2" />
+                                        <li aria-hidden="true" className="h-px bg-[#0f172a]/5 my-2 mx-2" />
 
-                                    <li>
-                                        <button
-                                            type="button"
-                                            onClick={handleLogout}
-                                            disabled={loggingOut}
-                                            className={`w-full text-center px-4 py-3.5 rounded-xl bg-[#0f172a] text-[#Fdfaf3] font-medium transition-colors hover:bg-[#7a947c] disabled:opacity-60 ${focusRing}`}
-                                        >
-                                            {loggingOut ? "Signing out…" : "Sign out"}
-                                        </button>
-                                    </li>
-                                </ul>
-                            ) : (
-                                <Link
-                                    href="/login"
-                                    onClick={closeMenu}
-                                    className={`block text-center px-4 py-3.5 rounded-xl bg-[#0f172a] text-[#Fdfaf3] font-medium transition-colors hover:bg-[#7a947c] ${focusRing}`}
-                                >
-                                    Sign in
-                                </Link>
-                            )}
+                                        <li>
+                                            <button
+                                                type="button"
+                                                onClick={handleLogout}
+                                                disabled={loggingOut}
+                                                className={`w-full text-center px-4 py-3.5 rounded-xl bg-[#0f172a] text-[#Fdfaf3] font-medium transition-colors hover:bg-[#7a947c] disabled:opacity-60 ${focusRing}`}
+                                            >
+                                                {loggingOut ? "Signing out…" : "Sign out"}
+                                            </button>
+                                        </li>
+                                    </ul>
+                                ) : (
+                                    <Link
+                                        href="/login"
+                                        onClick={closeMenu}
+                                        className={`block text-center px-4 py-3.5 rounded-xl bg-[#0f172a] text-[#Fdfaf3] font-medium transition-colors hover:bg-[#7a947c] ${focusRing}`}
+                                    >
+                                        Sign in
+                                    </Link>
+                                )}
+                            </div>
                         </div>
                     </div>
-                </div>
+                )}
             </nav>
         </header>
     );

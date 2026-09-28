@@ -21,7 +21,19 @@ interface Family {
 interface Member {
   user_id: string;
   display_name: string;
+  username: string | null;
+  avatar_url: string | null;
   joined_at: string;
+}
+
+interface MemberMeta {
+  isMe: boolean;
+  /** Short label for chips and badges: "You", "@username" or display name */
+  label: string;
+  /** Full identity for lists: "@username" or display name */
+  name: string;
+  avatarUrl: string | null;
+  color: string;
 }
 
 interface Book {
@@ -65,6 +77,14 @@ const STATUS_FILTERS = [
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+const FALLBACK_META: MemberMeta = {
+  isMe: false,
+  label: "Family",
+  name: "Family member",
+  avatarUrl: null,
+  color: MEMBER_COLORS[0],
+};
+
 // ============================================================
 // Helpers
 // ============================================================
@@ -83,7 +103,8 @@ function statusLabel(status: string | null) {
 }
 
 function initials(name: string) {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
+  const cleaned = name.replace(/^@/, "").trim();
+  const parts = cleaned.split(/[\s._-]+/).filter(Boolean);
   if (parts.length === 0) return "?";
   if (parts.length === 1) return parts[0].slice(0, 1).toUpperCase();
   return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
@@ -107,26 +128,47 @@ const focusRing =
 function Avatar({
   name,
   color,
+  imageUrl,
   size = "md",
   ring = false,
 }: {
   name: string;
   color: string;
+  imageUrl?: string | null;
   size?: "sm" | "md" | "lg";
   ring?: boolean;
 }) {
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    setFailed(false);
+  }, [imageUrl]);
+
   const sizes = {
     sm: "w-6 h-6 text-[10px]",
     md: "w-10 h-10 text-sm",
     lg: "w-12 h-12 text-base",
   };
 
+  const base = `${sizes[size]} rounded-full shrink-0 overflow-hidden ${ring ? "ring-2 ring-[#Fdfaf3]" : ""}`;
+
+  if (imageUrl && !failed) {
+    return (
+      <img
+        src={imageUrl}
+        alt=""
+        aria-hidden="true"
+        loading="lazy"
+        onError={() => setFailed(true)}
+        className={`${base} object-cover bg-slate-200`}
+      />
+    );
+  }
+
   return (
     <span
       aria-hidden="true"
-      className={`${sizes[size]} rounded-full flex items-center justify-center text-white font-semibold shrink-0 ${
-        ring ? "ring-2 ring-[#Fdfaf3]" : ""
-      }`}
+      className={`${base} flex items-center justify-center text-white font-semibold`}
       style={{ backgroundColor: color }}
     >
       {initials(name)}
@@ -325,7 +367,8 @@ export default function FamilyPage() {
 
       setFamily(familyResult.data as Family);
 
-      // Members: prefer the RPC (includes names); fall back to the table
+      // Members: prefer the RPC (names, usernames, avatars in one call).
+      // Fallback: membership rows + profiles table.
       let loadedMembers: Member[] = [];
 
       if (membersResult.error) {
@@ -346,13 +389,37 @@ export default function FamilyPage() {
           return;
         }
 
-        loadedMembers = (rows || []).map((row, i) => ({
-          user_id: row.user_id,
-          joined_at: row.joined_at,
-          display_name: row.user_id === currentUserId ? "You" : `Member ${i + 1}`,
-        }));
+        const ids = (rows || []).map((r) => r.user_id as string);
+
+        const { data: profileRows, error: profilesError } = ids.length
+          ? await supabase.from("profiles").select("id, username, avatar_url").in("id", ids)
+          : { data: [], error: null };
+
+        if (profilesError) console.error("Profiles load failed:", profilesError.message);
+
+        const profileById = new Map(
+          (profileRows || []).map((p) => [
+            p.id as string,
+            p as { username: string | null; avatar_url: string | null },
+          ])
+        );
+
+        loadedMembers = (rows || []).map((row, i) => {
+          const profile = profileById.get(row.user_id);
+          return {
+            user_id: row.user_id,
+            joined_at: row.joined_at,
+            username: profile?.username ?? null,
+            avatar_url: profile?.avatar_url ?? null,
+            display_name: profile?.username || `Member ${i + 1}`,
+          };
+        });
       } else {
-        loadedMembers = (membersResult.data || []) as Member[];
+        loadedMembers = ((membersResult.data || []) as Member[]).map((m) => ({
+          ...m,
+          username: m.username ?? null,
+          avatar_url: m.avatar_url ?? null,
+        }));
       }
 
       setMembers(loadedMembers);
@@ -563,7 +630,10 @@ export default function FamilyPage() {
         return;
       }
 
+      // Prefer the inviter's username so the email matches what the family sees
+      const myMember = members.find((m) => m.user_id === user.id);
       const inviterName =
+        (myMember?.username && `@${myMember.username}`) ||
         user.user_metadata?.full_name ||
         user.user_metadata?.name ||
         user.email?.split("@")[0] ||
@@ -610,15 +680,26 @@ export default function FamilyPage() {
   // ============================================================
 
   const memberMeta = useMemo(() => {
-    const map: Record<string, { name: string; color: string }> = {};
+    const map: Record<string, MemberMeta> = {};
     members.forEach((member, i) => {
+      const isMe = member.user_id === userId;
+      const name = member.username ? `@${member.username}` : member.display_name;
       map[member.user_id] = {
-        name: member.user_id === userId ? "You" : member.display_name,
+        isMe,
+        name,
+        label: isMe ? "You" : name,
+        avatarUrl: member.avatar_url,
         color: MEMBER_COLORS[i % MEMBER_COLORS.length],
       };
     });
     return map;
   }, [members, userId]);
+
+  const metaFor = (id: string) => memberMeta[id] || FALLBACK_META;
+
+  const me = userId ? memberMeta[userId] : undefined;
+  const myProfileIncomplete =
+    !!userId && !members.find((m) => m.user_id === userId)?.username;
 
   const bookCountByOwner = useMemo(() => {
     const counts: Record<string, number> = {};
@@ -773,20 +854,33 @@ export default function FamilyPage() {
             </p>
           </div>
 
-          <ul className="flex -space-x-2" aria-label="Family members">
-            {members.map((member) => (
-              <li key={member.user_id} title={memberMeta[member.user_id]?.name}>
-                <Avatar
-                  name={memberMeta[member.user_id]?.name || "?"}
-                  color={memberMeta[member.user_id]?.color || MEMBER_COLORS[0]}
-                  size="lg"
-                  ring
-                />
-                <span className="sr-only">{memberMeta[member.user_id]?.name}</span>
-              </li>
-            ))}
-          </ul>
+          <div className="flex flex-col items-start md:items-end gap-3">
+            <ul className="flex -space-x-2" aria-label="Family members">
+              {members.map((member) => {
+                const meta = metaFor(member.user_id);
+                const fullLabel = meta.isMe ? `${meta.name} (you)` : meta.name;
+                return (
+                  <li key={member.user_id} title={fullLabel}>
+                    <Avatar name={meta.name} color={meta.color} imageUrl={meta.avatarUrl} size="lg" ring />
+                    <span className="sr-only">{fullLabel}</span>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
         </header>
+
+        {myProfileIncomplete && (
+          <div className="mb-8 flex flex-col sm:flex-row sm:items-center gap-3 px-5 py-4 rounded-2xl bg-[#f6ecd4]/60 border border-[#c5a24a]/25 text-sm text-[#7a5d1c]">
+            <p className="flex-1">Add a username and picture so your family can tell your books apart.</p>
+            <Link
+              href="/profile"
+              className={`shrink-0 h-9 px-4 inline-flex items-center rounded-full bg-[#0f172a] text-[#Fdfaf3] text-xs font-medium hover:bg-[#7a947c] transition-colors ${focusRing}`}
+            >
+              Set up profile
+            </Link>
+          </div>
+        )}
 
         <div className="mb-8" aria-live="polite">
           <NoticeBanner notice={notice} onDismiss={() => setNotice(null)} />
@@ -816,7 +910,7 @@ export default function FamilyPage() {
               </button>
 
               {members.map((member) => {
-                const meta = memberMeta[member.user_id];
+                const meta = metaFor(member.user_id);
                 const active = ownerFilter === member.user_id;
                 return (
                   <button
@@ -830,8 +924,8 @@ export default function FamilyPage() {
                         : "bg-white text-slate-600 border-slate-200 hover:border-[#7a947c]"
                     }`}
                   >
-                    <Avatar name={meta?.name || "?"} color={meta?.color || MEMBER_COLORS[0]} size="sm" />
-                    {meta?.name}
+                    <Avatar name={meta.name} color={meta.color} imageUrl={meta.avatarUrl} size="sm" />
+                    {meta.label}
                     <span className={`text-xs px-1.5 rounded-full ${active ? "bg-white/15" : "bg-slate-100"}`}>
                       {bookCountByOwner[member.user_id] || 0}
                     </span>
@@ -917,17 +1011,16 @@ export default function FamilyPage() {
             ) : (
               <ul className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-x-5 gap-y-9">
                 {filteredBooks.map((book) => {
-                  const meta = memberMeta[book.user_id];
-                  const isMine = book.user_id === userId;
+                  const meta = metaFor(book.user_id);
 
                   const card = (
                     <>
                       <div className="relative aspect-[2/3] rounded-xl overflow-hidden bg-[#e9e4d9] shadow-md group-hover:shadow-xl group-hover:-translate-y-1 transition-all duration-300">
                         <CoverImage sources={coverSources(book)} title={book.title} author={book.author} />
 
-                        <span className="absolute bottom-2 left-2 inline-flex items-center gap-1.5 pl-0.5 pr-2.5 py-0.5 rounded-full bg-[#Fdfaf3]/95 text-[11px] font-medium text-[#0f172a] shadow-sm">
-                          <Avatar name={meta?.name || "?"} color={meta?.color || MEMBER_COLORS[0]} size="sm" />
-                          {meta?.name || "Family"}
+                        <span className="absolute bottom-2 left-2 max-w-[calc(100%-1rem)] inline-flex items-center gap-1.5 pl-0.5 pr-2.5 py-0.5 rounded-full bg-[#Fdfaf3]/95 text-[11px] font-medium text-[#0f172a] shadow-sm">
+                          <Avatar name={meta.name} color={meta.color} imageUrl={meta.avatarUrl} size="sm" />
+                          <span className="truncate">{meta.label}</span>
                         </span>
                       </div>
 
@@ -945,7 +1038,7 @@ export default function FamilyPage() {
 
                   return (
                     <li key={book.id}>
-                      {isMine ? (
+                      {meta.isMe ? (
                         <Link
                           href={`/library/${book.id}`}
                           className={`group block rounded-xl ${focusRing}`}
@@ -954,7 +1047,7 @@ export default function FamilyPage() {
                           {card}
                         </Link>
                       ) : (
-                        <div className="group" aria-label={`${book.title}, owned by ${meta?.name || "a family member"}`}>
+                        <div className="group" aria-label={`${book.title}, owned by ${meta.name}`}>
                           {card}
                         </div>
                       )}
@@ -978,7 +1071,8 @@ export default function FamilyPage() {
 
               <ul className="space-y-1">
                 {members.map((member) => {
-                  const meta = memberMeta[member.user_id];
+                  const meta = metaFor(member.user_id);
+                  const count = bookCountByOwner[member.user_id] || 0;
                   return (
                     <li key={member.user_id}>
                       <button
@@ -991,12 +1085,17 @@ export default function FamilyPage() {
                           ownerFilter === member.user_id ? "bg-[#Fdfaf3]" : "hover:bg-[#Fdfaf3]"
                         }`}
                       >
-                        <Avatar name={meta?.name || "?"} color={meta?.color || MEMBER_COLORS[0]} />
+                        <Avatar name={meta.name} color={meta.color} imageUrl={meta.avatarUrl} />
                         <span className="flex-1 min-w-0">
-                          <span className="block font-medium truncate">
-                            {meta?.name}
+                          <span className="flex items-center gap-2 min-w-0">
+                            <span className="font-medium truncate">{meta.name}</span>
+                            {meta.isMe && (
+                              <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded-full bg-[#d8d0e3]/60 text-[#0f172a]">
+                                You
+                              </span>
+                            )}
                             {member.user_id === family.created_by && (
-                              <span className="ml-2 text-[11px] font-normal text-[#7a947c]">Founder</span>
+                              <span className="shrink-0 text-[11px] text-[#7a947c]">Founder</span>
                             )}
                           </span>
                           <span className="block text-xs text-slate-400">
@@ -1004,8 +1103,7 @@ export default function FamilyPage() {
                           </span>
                         </span>
                         <span className="text-xs text-slate-500 shrink-0">
-                          {bookCountByOwner[member.user_id] || 0}{" "}
-                          {(bookCountByOwner[member.user_id] || 0) === 1 ? "book" : "books"}
+                          {count} {count === 1 ? "book" : "books"}
                         </span>
                       </button>
                     </li>
