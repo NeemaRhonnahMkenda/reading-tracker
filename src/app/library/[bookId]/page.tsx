@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Navbar from "../../components/Navbar";
 import { supabase } from "../../../lib/supabase";
@@ -11,6 +11,7 @@ interface Book {
   title: string;
   author: string | null;
   cover_url: string | null;
+  custom_cover_path: string | null;
   status: string | null;
 }
 
@@ -36,6 +37,34 @@ type Toast = {
   type: "success" | "error";
   message: string;
 } | null;
+
+// --------------------------------------------------
+// Cover storage config (keep in sync with the library page)
+// --------------------------------------------------
+
+const COVER_BUCKET =
+  process.env.NEXT_PUBLIC_SUPABASE_COVER_BUCKET || "book-covers";
+const MAX_COVER_BYTES = 5 * 1024 * 1024; // 5 MB
+const SIGNED_URL_TTL = 60 * 60; // 1 hour
+
+const ALLOWED_COVER_TYPES: Record<string, string> = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+};
+
+// Check real file type from magic bytes instead of trusting file.type
+async function sniffImageType(file: File): Promise<string | null> {
+  const bytes = new Uint8Array(await file.slice(0, 12).arrayBuffer());
+
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+    return "image/png";
+  }
+  const ascii = String.fromCharCode(...bytes);
+  if (ascii.startsWith("RIFF") && ascii.slice(8, 12) === "WEBP") return "image/webp";
+  return null;
+}
 
 // --------------------------------------------------
 // Shared helpers (module scope: created once, not per render)
@@ -93,6 +122,51 @@ const RATING_LABEL: Record<number, string> = {
   5: "A new favourite",
 };
 
+// --------------------------------------------------
+// Cover image: tries each source in order, then shows the placeholder
+// --------------------------------------------------
+
+function CoverImage({
+  sources,
+  title,
+  author,
+}: {
+  sources: string[];
+  title: string;
+  author: string | null;
+}) {
+  const [index, setIndex] = useState(0);
+  const key = sources.join("|");
+
+  useEffect(() => {
+    setIndex(0);
+  }, [key]);
+
+  const src = sources[index];
+
+  if (src) {
+    return (
+      <img
+        src={src}
+        alt={`Cover of ${title}`}
+        onError={() => setIndex((i) => i + 1)}
+        className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-[1.025]"
+      />
+    );
+  }
+
+  return (
+    <div className="w-full h-full bg-[#0f172a] text-[#fdfaf3] p-7 flex flex-col justify-between">
+      <span className="text-[10px] tracking-[0.2em] opacity-50">The Archive</span>
+      <div>
+        <p className="font-classical text-2xl leading-tight">{title}</p>
+        {author && <p className="text-sm opacity-60 mt-3">{author}</p>}
+      </div>
+      <span className="font-classical text-3xl opacity-30">A</span>
+    </div>
+  );
+}
+
 export default function BookReviewPage() {
   const router = useRouter();
   const params = useParams();
@@ -108,6 +182,20 @@ export default function BookReviewPage() {
   const [journalEntries, setJournalEntries] = useState<JournalEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+
+  // --------------------------------------------------
+  // Custom cover
+  // --------------------------------------------------
+
+  const [customCoverUrl, setCustomCoverUrl] = useState<string | null>(null);
+  const [showCoverModal, setShowCoverModal] = useState(false);
+  const [coverFile, setCoverFile] = useState<File | null>(null);
+  const [coverFileType, setCoverFileType] = useState<string | null>(null);
+  const [coverPreview, setCoverPreview] = useState<string | null>(null);
+  const [coverError, setCoverError] = useState("");
+  const [savingCover, setSavingCover] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  const coverInputRef = useRef<HTMLInputElement | null>(null);
 
   // --------------------------------------------------
   // Tabs
@@ -147,10 +235,30 @@ export default function BookReviewPage() {
   const [hoveredRating, setHoveredRating] = useState(0);
 
   // --------------------------------------------------
-  // Load page — book, review and journal entries are independent
-  // of one another (all keyed off bookId/userId), so they're fetched
-  // in parallel with Promise.all instead of three sequential
-  // round trips. This cuts a ~3x waterfall down to a single hop.
+  // Signed URL for the private custom cover
+  // --------------------------------------------------
+
+  async function signCustomCover(path: string | null) {
+    if (!path) {
+      setCustomCoverUrl(null);
+      return;
+    }
+
+    const { data, error: signError } = await supabase.storage
+      .from(COVER_BUCKET)
+      .createSignedUrl(path, SIGNED_URL_TTL);
+
+    if (signError || !data?.signedUrl) {
+      console.error("Error signing custom cover:", signError?.message);
+      setCustomCoverUrl(null);
+      return;
+    }
+
+    setCustomCoverUrl(data.signedUrl);
+  }
+
+  // --------------------------------------------------
+  // Load page. Book, review and journal entries are fetched in parallel.
   // --------------------------------------------------
 
   useEffect(() => {
@@ -170,7 +278,7 @@ export default function BookReviewPage() {
       } = await supabase.auth.getSession();
 
       if (sessionError || !session?.user) {
-        router.push("/signin");
+        router.push("/login");
         return;
       }
 
@@ -180,7 +288,7 @@ export default function BookReviewPage() {
       const [bookResult, reviewResult, journalResult] = await Promise.all([
         supabase
           .from("books")
-          .select("id, user_id, title, author, cover_url, status")
+          .select("id, user_id, title, author, cover_url, custom_cover_path, status")
           .eq("id", bookId)
           .eq("user_id", currentUserId)
           .single(),
@@ -205,7 +313,9 @@ export default function BookReviewPage() {
         return;
       }
 
-      setBook(bookResult.data);
+      const loadedBook = bookResult.data as Book;
+      setBook(loadedBook);
+      await signCustomCover(loadedBook.custom_cover_path);
 
       if (reviewResult.error) {
         console.error("Error loading review:", reviewResult.error);
@@ -230,6 +340,17 @@ export default function BookReviewPage() {
       setLoading(false);
     }
   }
+
+  // --------------------------------------------------
+  // Cover sources: catalogue URL first, custom cover as fallback
+  // --------------------------------------------------
+
+  const coverSources = useMemo(() => {
+    const sources: string[] = [];
+    if (book?.cover_url) sources.push(book.cover_url);
+    if (customCoverUrl) sources.push(customCoverUrl);
+    return sources;
+  }, [book?.cover_url, customCoverUrl]);
 
   // --------------------------------------------------
   // Unsaved review changes
@@ -272,6 +393,196 @@ export default function BookReviewPage() {
   const showToast = useCallback((type: "success" | "error", message: string) => {
     setToast({ type, message });
   }, []);
+
+  // --------------------------------------------------
+  // Cover modal: preview cleanup, Escape, scroll lock
+  // --------------------------------------------------
+
+  useEffect(() => {
+    return () => {
+      if (coverPreview) URL.revokeObjectURL(coverPreview);
+    };
+  }, [coverPreview]);
+
+  useEffect(() => {
+    if (!showCoverModal) return;
+
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !savingCover) closeCoverModal();
+    };
+
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", onKey);
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", onKey);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showCoverModal, savingCover]);
+
+  // --------------------------------------------------
+  // Cover selection
+  // --------------------------------------------------
+
+  function resetCoverSelection() {
+    setCoverFile(null);
+    setCoverFileType(null);
+    setCoverPreview(null);
+    setCoverError("");
+    setDragOver(false);
+    if (coverInputRef.current) coverInputRef.current.value = "";
+  }
+
+  function openCoverModal() {
+    resetCoverSelection();
+    setShowCoverModal(true);
+  }
+
+  function closeCoverModal() {
+    if (savingCover) return;
+    resetCoverSelection();
+    setShowCoverModal(false);
+  }
+
+  async function handleCoverFile(file: File | null | undefined) {
+    setCoverError("");
+    if (!file) return;
+
+    if (file.size > MAX_COVER_BYTES) {
+      setCoverError("That image is over 5 MB. Choose a smaller file.");
+      return;
+    }
+
+    const realType = await sniffImageType(file);
+
+    if (!realType || !ALLOWED_COVER_TYPES[realType]) {
+      setCoverError("Use a JPG, PNG or WebP image.");
+      return;
+    }
+
+    setCoverFile(file);
+    setCoverFileType(realType);
+    setCoverPreview(URL.createObjectURL(file));
+  }
+
+  // --------------------------------------------------
+  // Save custom cover: upload new → update row → remove old file
+  // --------------------------------------------------
+
+  async function saveCustomCover() {
+    if (!book || !userId || !coverFile || !coverFileType) return;
+
+    setSavingCover(true);
+    setCoverError("");
+
+    const previousPath = book.custom_cover_path;
+    const newPath = `${userId}/${crypto.randomUUID()}.${ALLOWED_COVER_TYPES[coverFileType]}`;
+
+    try {
+      const { error: uploadError } = await supabase.storage
+        .from(COVER_BUCKET)
+        .upload(newPath, coverFile, {
+          contentType: coverFileType,
+          cacheControl: "3600",
+          upsert: false,
+        });
+
+      if (uploadError) {
+        console.error("Cover upload failed:", uploadError.message);
+        setCoverError("The cover didn't upload. Try again.");
+        return;
+      }
+
+      const { data, error: updateError } = await supabase
+        .from("books")
+        .update({ custom_cover_path: newPath })
+        .eq("id", book.id)
+        .eq("user_id", userId)
+        .select("id, user_id, title, author, cover_url, custom_cover_path, status")
+        .single();
+
+      if (updateError || !data) {
+        console.error("Cover update failed:", updateError?.message);
+        await supabase.storage.from(COVER_BUCKET).remove([newPath]);
+        setCoverError("The cover couldn't be saved to this book. Try again.");
+        return;
+      }
+
+      // Clean up the file being replaced
+      if (previousPath && previousPath !== newPath) {
+        const { error: removeError } = await supabase.storage
+          .from(COVER_BUCKET)
+          .remove([previousPath]);
+        if (removeError) console.error("Old cover cleanup failed:", removeError.message);
+      }
+
+      setBook(data as Book);
+      await signCustomCover(newPath);
+
+      resetCoverSelection();
+      setShowCoverModal(false);
+      showToast(
+        "success",
+        book.cover_url
+          ? "Cover photo saved. It shows if the catalogue cover is unavailable."
+          : "Cover photo saved."
+      );
+    } catch (err) {
+      console.error("Unexpected cover save error:", err);
+      await supabase.storage.from(COVER_BUCKET).remove([newPath]);
+      setCoverError("The cover couldn't be saved. Try again.");
+    } finally {
+      setSavingCover(false);
+    }
+  }
+
+  // --------------------------------------------------
+  // Remove custom cover
+  // --------------------------------------------------
+
+  async function removeCustomCover() {
+    if (!book || !userId || !book.custom_cover_path) return;
+
+    const confirmed = window.confirm("Remove your cover photo from this book?");
+    if (!confirmed) return;
+
+    setSavingCover(true);
+    setCoverError("");
+
+    const pathToRemove = book.custom_cover_path;
+
+    try {
+      const { data, error: updateError } = await supabase
+        .from("books")
+        .update({ custom_cover_path: null })
+        .eq("id", book.id)
+        .eq("user_id", userId)
+        .select("id, user_id, title, author, cover_url, custom_cover_path, status")
+        .single();
+
+      if (updateError || !data) {
+        console.error("Cover removal failed:", updateError?.message);
+        setCoverError("The cover photo couldn't be removed. Try again.");
+        return;
+      }
+
+      const { error: removeError } = await supabase.storage
+        .from(COVER_BUCKET)
+        .remove([pathToRemove]);
+      if (removeError) console.error("Cover file cleanup failed:", removeError.message);
+
+      setBook(data as Book);
+      setCustomCoverUrl(null);
+
+      resetCoverSelection();
+      setShowCoverModal(false);
+      showToast("success", "Cover photo removed.");
+    } finally {
+      setSavingCover(false);
+    }
+  }
 
   // --------------------------------------------------
   // Navigation
@@ -339,7 +650,7 @@ export default function BookReviewPage() {
 
       if (saveError) {
         console.error("Error saving review:", saveError);
-        setError(`Could not save your review: ${saveError.message}`);
+        setError("Your review couldn't be saved. Try again.");
         return;
       }
 
@@ -394,7 +705,7 @@ export default function BookReviewPage() {
 
       if (journalError) {
         console.error("Error saving journal entry:", journalError);
-        setError(`Could not save your journal entry: ${journalError.message}`);
+        setError("Your journal entry couldn't be saved. Try again.");
         return;
       }
 
@@ -415,6 +726,8 @@ export default function BookReviewPage() {
   // --------------------------------------------------
 
   async function deleteJournalEntry(id: string) {
+    if (!userId) return;
+
     const confirmed = window.confirm(
       "Are you sure you want to delete this journal entry?"
     );
@@ -504,10 +817,17 @@ export default function BookReviewPage() {
     );
   }
 
+  const hasCustomCover = !!book.custom_cover_path;
+  const modalPreviewSources = coverPreview
+    ? [coverPreview]
+    : customCoverUrl
+    ? [customCoverUrl]
+    : [];
+
   return (
     <main className="min-h-screen bg-[#fdfaf3] text-[#0f172a] font-sans selection:bg-[#d8d0e3] selection:text-[#0f172a]">
       {/* ==================================================
-          PAGE ATMOSPHERE — same static-gradient treatment as the home page
+          PAGE ATMOSPHERE
       ================================================== */}
 
       <div className="fixed inset-0 pointer-events-none overflow-hidden -z-10">
@@ -530,6 +850,10 @@ export default function BookReviewPage() {
 
             .soft-surface { background: rgba(255, 255, 255, 0.6); backdrop-filter: blur(12px); }
             .soft-border { border-color: rgba(15, 23, 42, 0.08); }
+
+            @keyframes sheet-in { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+            .animate-sheet-in { animation: sheet-in 300ms cubic-bezier(.2,.8,.2,1) both; }
+            @media (prefers-reduced-motion: reduce) { .animate-sheet-in { animation: none; } }
           `,
         }}
       />
@@ -541,7 +865,7 @@ export default function BookReviewPage() {
       ================================================== */}
 
       {toast && (
-        <div className="fixed top-24 right-5 z-[70] w-[calc(100%-40px)] sm:w-auto sm:min-w-[320px]">
+        <div className="fixed top-24 right-5 z-[70] w-[calc(100%-40px)] sm:w-auto sm:min-w-[320px] sm:max-w-sm" role="status">
           <div
             className={`flex items-start gap-3 rounded-2xl px-5 py-4 shadow-[0_15px_45px_rgba(15,23,42,0.12)] border backdrop-blur-xl ${
               toast.type === "success"
@@ -550,7 +874,7 @@ export default function BookReviewPage() {
             }`}
           >
             <div
-              className={`mt-0.5 w-7 h-7 rounded-full flex items-center justify-center text-sm ${
+              className={`mt-0.5 w-7 h-7 rounded-full flex items-center justify-center text-sm shrink-0 ${
                 toast.type === "success" ? "bg-[#7a947c] text-white" : "bg-red-500 text-white"
               }`}
             >
@@ -601,24 +925,19 @@ export default function BookReviewPage() {
               <div className="absolute -inset-4 bg-[#0f172a]/8 rounded-[2rem] blur-2xl opacity-60" />
 
               <div className="relative aspect-[2/3] rounded-[1.35rem] overflow-hidden shadow-[0_24px_55px_rgba(15,23,42,0.18)] bg-slate-200 ring-1 ring-[#0f172a]/10">
-                {book.cover_url ? (
-                  <img
-                    src={book.cover_url}
-                    alt={`Cover of ${book.title}`}
-                    className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-[1.025]"
-                  />
-                ) : (
-                  <div className="w-full h-full bg-[#0f172a] text-[#fdfaf3] p-7 flex flex-col justify-between">
-                    <span className="text-[10px] tracking-[0.2em] opacity-50">The Archive</span>
+                <CoverImage sources={coverSources} title={book.title} author={book.author} />
 
-                    <div>
-                      <h1 className="font-classical text-2xl leading-tight">{book.title}</h1>
-                      {book.author && <p className="text-sm opacity-60 mt-3">{book.author}</p>}
-                    </div>
-
-                    <span className="font-classical text-3xl opacity-30">A</span>
-                  </div>
-                )}
+                {/* Change cover control: always visible on touch, reveals on hover for desktop */}
+                <div className="absolute inset-x-0 bottom-0 p-3 bg-gradient-to-t from-[#0f172a]/70 to-transparent lg:opacity-0 lg:group-hover:opacity-100 lg:focus-within:opacity-100 transition-opacity">
+                  <button
+                    type="button"
+                    onClick={openCoverModal}
+                    className="w-full inline-flex items-center justify-center gap-2 bg-[#fdfaf3]/95 text-[#0f172a] text-xs font-semibold py-2.5 rounded-full hover:bg-white transition-colors outline-none focus-visible:ring-2 focus-visible:ring-[#7a947c]"
+                  >
+                    <CameraIcon />
+                    {hasCustomCover ? "Change cover photo" : "Add cover photo"}
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -822,7 +1141,7 @@ export default function BookReviewPage() {
                   </div>
 
                   <p className="text-sm text-slate-500 leading-6 mb-7 font-light">
-                    Capture the little things you don't want to forget while you're reading.
+                    Capture the little things you don&apos;t want to forget while you&apos;re reading.
                   </p>
 
                   <label htmlFor="journal-date" className="block text-sm font-medium text-slate-600 mb-2.5">
@@ -1077,6 +1396,151 @@ export default function BookReviewPage() {
       </section>
 
       {/* ==================================================
+          COVER PHOTO MODAL
+      ================================================== */}
+
+      {showCoverModal && (
+        <div
+          className="fixed inset-0 z-[60] bg-[#0f172a]/55 backdrop-blur-sm flex items-end sm:items-center justify-center sm:px-5"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) closeCoverModal();
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="cover-modal-title"
+            className="w-full sm:max-w-lg max-h-[94vh] overflow-y-auto bg-[#fdfaf3] border border-[#0f172a]/10 rounded-t-[1.6rem] sm:rounded-[1.6rem] shadow-[0_25px_80px_rgba(15,23,42,0.22)] animate-sheet-in"
+          >
+            <div className="p-6 sm:p-8">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <h2 id="cover-modal-title" className="text-3xl font-classical font-semibold text-[#0f172a]">
+                    {hasCustomCover ? "Change cover photo" : "Add a cover photo"}
+                  </h2>
+                  <p className="text-sm text-slate-500 mt-2 leading-6 font-light">
+                    {book.cover_url
+                      ? "Your photo is kept as a backup and shows whenever the catalogue cover can't load."
+                      : "Photograph your copy so it stands out on your shelf."}
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={closeCoverModal}
+                  disabled={savingCover}
+                  aria-label="Close"
+                  className="shrink-0 w-10 h-10 rounded-full flex items-center justify-center text-slate-400 hover:text-[#0f172a] hover:bg-[#0f172a]/5 transition-colors disabled:opacity-40"
+                >
+                  <span aria-hidden="true" className="text-2xl leading-none">×</span>
+                </button>
+              </div>
+
+              <div className="mt-7 flex gap-5 items-start">
+                {/* Preview */}
+                <div className="w-28 sm:w-32 shrink-0">
+                  <div className="relative aspect-[2/3] rounded-xl overflow-hidden shadow-md bg-[#e9e4d9] ring-1 ring-[#0f172a]/10">
+                    <CoverImage sources={modalPreviewSources} title={book.title} author={book.author} />
+                    {coverPreview && (
+                      <span className="absolute top-2 left-2 text-[10px] px-2 py-0.5 rounded-full bg-[#7a947c] text-white shadow">
+                        New
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                {/* Picker */}
+                <div className="flex-1 min-w-0">
+                  <input
+                    ref={coverInputRef}
+                    id="cover-file"
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp"
+                    capture="environment"
+                    className="sr-only"
+                    onChange={(event) => handleCoverFile(event.target.files?.[0])}
+                  />
+
+                  <label
+                    htmlFor="cover-file"
+                    onDragOver={(event) => {
+                      event.preventDefault();
+                      setDragOver(true);
+                    }}
+                    onDragLeave={() => setDragOver(false)}
+                    onDrop={(event) => {
+                      event.preventDefault();
+                      setDragOver(false);
+                      handleCoverFile(event.dataTransfer.files?.[0]);
+                    }}
+                    className={`flex flex-col items-center justify-center gap-2 text-center min-h-[140px] p-4 rounded-2xl border-2 border-dashed cursor-pointer transition-all ${
+                      dragOver
+                        ? "border-[#7a947c] bg-[#7a947c]/10"
+                        : "border-[#0f172a]/15 bg-white hover:border-[#7a947c] hover:bg-[#7a947c]/5"
+                    }`}
+                  >
+                    <span className="w-10 h-10 rounded-full bg-[#7a947c]/15 text-[#7a947c] flex items-center justify-center" aria-hidden="true">
+                      <CameraIcon size={18} />
+                    </span>
+                    <span className="text-sm font-medium text-[#0f172a]">
+                      {coverFile ? "Choose a different image" : "Take a photo or choose an image"}
+                    </span>
+                    <span className="text-xs text-slate-400">JPG, PNG or WebP, up to 5 MB</span>
+                  </label>
+
+                  {coverFile && (
+                    <p className="mt-2 text-xs text-slate-500 truncate">
+                      {coverFile.name} · {(coverFile.size / 1024 / 1024).toFixed(1)} MB
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              {coverError && (
+                <div role="alert" className="mt-5 px-4 py-3 rounded-xl bg-[#f8e9e5]/90 border border-[#e8cbc4] text-[#a14e43] text-sm">
+                  {coverError}
+                </div>
+              )}
+
+              <div className="flex flex-col-reverse sm:flex-row sm:items-center gap-3 mt-8">
+                {hasCustomCover && !coverFile && (
+                  <button
+                    type="button"
+                    onClick={removeCustomCover}
+                    disabled={savingCover}
+                    className="sm:mr-auto text-sm text-slate-400 hover:text-[#a34d43] px-3 py-2 rounded-lg hover:bg-[#f7e9e6] transition-all disabled:opacity-40"
+                  >
+                    Remove my photo
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={closeCoverModal}
+                  disabled={savingCover}
+                  className={`${hasCustomCover && !coverFile ? "" : "sm:ml-auto"} border border-[#0f172a]/12 bg-white/70 text-slate-600 px-6 py-3 rounded-full hover:border-[#0f172a]/30 hover:text-[#0f172a] transition-all text-sm font-semibold disabled:opacity-40`}
+                >
+                  Cancel
+                </button>
+
+                <button
+                  type="button"
+                  onClick={saveCustomCover}
+                  disabled={!coverFile || savingCover}
+                  className="bg-[#7a947c] text-white px-7 py-3 rounded-full hover:bg-[#6b826c] transition-all text-sm font-semibold disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center justify-center gap-2"
+                >
+                  {savingCover && (
+                    <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                  )}
+                  {savingCover ? "Saving…" : "Save cover"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ==================================================
           UNSAVED CHANGES MODAL
       ================================================== */}
 
@@ -1101,7 +1565,7 @@ export default function BookReviewPage() {
               </h2>
 
               <p className="text-slate-600 mt-4 leading-7 text-sm font-light">
-                You have made changes to your review that haven't been saved yet. If you leave this
+                You have made changes to your review that haven&apos;t been saved yet. If you leave this
                 page, those changes will be lost.
               </p>
 
@@ -1130,5 +1594,24 @@ export default function BookReviewPage() {
         </div>
       )}
     </main>
+  );
+}
+
+function CameraIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg
+      aria-hidden="true"
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M4 7h3l2-3h6l2 3h3v12H4z" />
+      <circle cx="12" cy="13" r="3.5" />
+    </svg>
   );
 }
