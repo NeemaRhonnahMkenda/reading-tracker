@@ -2,9 +2,10 @@
 
 // src/app/wishlist/page.tsx
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { BrowserMultiFormatReader } from "@zxing/browser";
 
 import Navbar from "../components/Navbar";
 import ShareWishlistCard from "./ShareWishlistCard";
@@ -255,6 +256,16 @@ export default function WishlistPage() {
   const [results, setResults] = useState<BookResult[] | null>(null);
   const [searchError, setSearchError] = useState("");
   const [addingKey, setAddingKey] = useState<string | null>(null);
+  const [isbnLookup, setIsbnLookup] = useState(false); // last search was a single ISBN
+  const [fromScan, setFromScan] = useState(false); // last search came from the camera
+
+  // Barcode scanner (same approach as the library page)
+  const [scanning, setScanning] = useState(false);
+  const [scannerError, setScannerError] = useState("");
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const scannerControlsRef = useRef<{ stop: () => void } | null>(null);
+  const hasScannedRef = useRef(false);
 
   // Wishlist filter
   const [filter, setFilter] = useState("");
@@ -373,37 +384,39 @@ export default function WishlistPage() {
   // Search
   // ============================================================
 
-  async function runSearch(event: FormEvent) {
-    event.preventDefault();
-
-    const q = query.trim();
-    setSearchError("");
-
-    if (q.length < 2) {
-      setSearchError("Type a title, an author, or an ISBN.");
-      return;
-    }
-
+  async function searchByIsbn(isbn: string) {
     setSearching(true);
+    setSearchError("");
     setResults(null);
+    setIsbnLookup(true);
 
     try {
-      const isbn = cleanIsbn(q);
+      const response = await fetch(`/api/books/isbn/${encodeURIComponent(isbn)}`);
+      const data = await response.json();
 
-      if (ISBN_PATTERN.test(isbn)) {
-        const response = await fetch(`/api/books/isbn/${encodeURIComponent(isbn)}`);
-        const data = await response.json();
-
-        if (!response.ok) {
-          setResults([]);
-          setSearchError(data.error || "No book matches that ISBN. Check the number and try again.");
-          return;
-        }
-
-        setResults([data as BookResult]);
+      if (!response.ok) {
+        setResults([]);
+        setSearchError(data.error || `No book found for ISBN ${isbn}. Try searching by the title instead.`);
         return;
       }
 
+      setResults([data as BookResult]);
+    } catch (error) {
+      console.error("ISBN lookup failed:", error);
+      setResults([]);
+      setSearchError("The lookup failed. Check your connection and try again.");
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  async function searchByText(q: string) {
+    setSearching(true);
+    setSearchError("");
+    setResults(null);
+    setIsbnLookup(false);
+
+    try {
       const response = await fetch(`/api/books/search?q=${encodeURIComponent(q)}`);
       const data = await response.json();
 
@@ -423,10 +436,184 @@ export default function WishlistPage() {
     }
   }
 
+  async function runSearch(event: FormEvent) {
+    event.preventDefault();
+
+    const q = query.trim();
+    setSearchError("");
+    setFromScan(false);
+    stopScanner();
+
+    if (q.length < 2) {
+      setSearchError("Type a title, an author, or an ISBN.");
+      return;
+    }
+
+    const isbn = cleanIsbn(q);
+    if (ISBN_PATTERN.test(isbn)) {
+      await searchByIsbn(isbn);
+    } else {
+      await searchByText(q);
+    }
+  }
+
   function clearSearch() {
     setQuery("");
     setResults(null);
     setSearchError("");
+    setIsbnLookup(false);
+    setFromScan(false);
+  }
+
+  // ============================================================
+  // Barcode scanner (mirrors the library page)
+  // ============================================================
+
+  function teardownCamera() {
+    if (scannerControlsRef.current) {
+      try {
+        scannerControlsRef.current.stop();
+      } catch {
+        // ignore
+      }
+      scannerControlsRef.current = null;
+    }
+
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    }
+
+    if (videoRef.current) {
+      try {
+        videoRef.current.pause();
+      } catch {
+        // ignore
+      }
+      videoRef.current.srcObject = null;
+    }
+  }
+
+  function stopScanner() {
+    teardownCamera();
+    hasScannedRef.current = false;
+    setScanning(false);
+  }
+
+  // Release the camera when the page closes
+  useEffect(() => {
+    return () => teardownCamera();
+  }, []);
+
+  // Release the camera when the tab is hidden (saves battery)
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") {
+        teardownCamera();
+        hasScannedRef.current = false;
+        setScanning(false);
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, []);
+
+  async function startScanner() {
+    setScannerError("");
+    setSearchError("");
+    setResults(null);
+    setIsbnLookup(false);
+    setFromScan(false);
+
+    // Make sure a previous session is fully released before starting again
+    teardownCamera();
+    hasScannedRef.current = false;
+    setScanning(true);
+
+    try {
+      if (!navigator?.mediaDevices?.getUserMedia) {
+        setScannerError(
+          window.isSecureContext
+            ? "This browser can't use the camera. Type the ISBN instead."
+            : "The camera only works over a secure (https) connection. Type the ISBN instead."
+        );
+        setScanning(false);
+        return;
+      }
+
+      const devices = await BrowserMultiFormatReader.listVideoInputDevices();
+
+      if (devices.length === 0) {
+        setScannerError("No camera found. Type the ISBN instead.");
+        setScanning(false);
+        return;
+      }
+
+      // Prefer the back camera. Labels are empty until permission is granted;
+      // passing undefined lets ZXing request the rear ("environment") camera.
+      const backCamera = devices.find((device) => {
+        const label = device.label.toLowerCase();
+        return label.includes("back") || label.includes("rear") || label.includes("environment");
+      });
+
+      if (!videoRef.current) {
+        setScannerError("The camera couldn't start. Try again.");
+        setScanning(false);
+        return;
+      }
+
+      const codeReader = new BrowserMultiFormatReader();
+
+      const controls = await codeReader.decodeFromVideoDevice(
+        backCamera?.deviceId,
+        videoRef.current,
+        (result) => {
+          if (!result || hasScannedRef.current) return;
+
+          const scanned = cleanIsbn(result.getText());
+
+          if (!ISBN_PATTERN.test(scanned)) {
+            setScannerError("That barcode isn't an ISBN. Try the barcode on the back cover.");
+            return;
+          }
+
+          // Mark as handled before anything else so it only fires once
+          hasScannedRef.current = true;
+          navigator.vibrate?.(60);
+
+          teardownCamera();
+          setScanning(false);
+          setScannerError("");
+
+          // Populate the search bar, then look the book up
+          setQuery(scanned);
+          setFromScan(true);
+          searchByIsbn(scanned);
+        }
+      );
+
+      scannerControlsRef.current = controls;
+
+      if (videoRef.current?.srcObject instanceof MediaStream) {
+        streamRef.current = videoRef.current.srcObject;
+      }
+
+      // If a barcode was read before the controls were ready, stop now
+      if (hasScannedRef.current) teardownCamera();
+    } catch (error) {
+      console.error("Barcode scanner error:", error);
+      teardownCamera();
+      setScanning(false);
+
+      const name = (error as Error)?.name;
+      setScannerError(
+        name === "NotAllowedError"
+          ? "Camera access was blocked. Allow it in your browser settings, or type the ISBN."
+          : name === "NotFoundError" || name === "OverconstrainedError"
+          ? "No camera was found. Type the ISBN instead."
+          : "The camera couldn't start. Type the ISBN instead."
+      );
+    }
   }
 
   // ============================================================
@@ -507,6 +694,7 @@ export default function WishlistPage() {
   // ============================================================
 
   function openTransfer(item: WishlistItem) {
+    stopScanner();
     setTransferItem(item);
     setTransferError("");
     setTStatus("want_to_read");
@@ -591,6 +779,9 @@ export default function WishlistPage() {
     );
   }, [items, filter]);
 
+  // A single ISBN result gets a clear "do I own this?" verdict
+  const singleResult = isbnLookup && results?.length === 1 ? results[0] : null;
+
   // ============================================================
   // Render
   // ============================================================
@@ -603,8 +794,12 @@ export default function WishlistPage() {
             @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;500;600;700&display=swap');
             .font-classical { font-family: 'Playfair Display', Georgia, serif; }
             @keyframes sheet-in { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+            @keyframes scan-line { 0%, 100% { transform: translateY(-44px); } 50% { transform: translateY(44px); } }
             .animate-sheet-in { animation: sheet-in 300ms cubic-bezier(.2,.8,.2,1) both; }
-            @media (prefers-reduced-motion: reduce) { .animate-sheet-in { animation: none; } }
+            .animate-scan-line { animation: scan-line 2.2s ease-in-out infinite; }
+            @media (prefers-reduced-motion: reduce) {
+              .animate-sheet-in, .animate-scan-line { animation: none; }
+            }
           `,
         }}
       />
@@ -622,11 +817,6 @@ export default function WishlistPage() {
           </p>
         </header>
 
-        {/* ---------------- Share ---------------- */}
-        <div className="mb-12">
-          <ShareWishlistCard userId={userId} itemCount={items.length} />
-        </div>
-
         {/* ---------------- Search ---------------- */}
         <section
           aria-labelledby="find-heading"
@@ -635,7 +825,9 @@ export default function WishlistPage() {
           <h2 id="find-heading" className="font-classical text-2xl font-semibold">
             Find a book
           </h2>
-          <p className="text-sm text-slate-500 mt-1">Search by title, author or ISBN.</p>
+          <p className="text-sm text-slate-500 mt-1">
+            Search by title, author or ISBN. In a bookshop, scan the barcode to see if you already have it.
+          </p>
 
           <form onSubmit={runSearch} className="mt-5" role="search">
             <label htmlFor="book-search" className="sr-only">
@@ -653,14 +845,28 @@ export default function WishlistPage() {
                   setQuery(e.target.value);
                   setSearchError("");
                 }}
-                placeholder="The Midnight Library, Matt Haig, or 9780525559474"
+                placeholder="Title, author or ISBN"
                 autoComplete="off"
                 className="flex-1 min-w-0 h-11 px-2 bg-transparent text-[#0f172a] placeholder:text-slate-400 focus:outline-none"
               />
               <button
+                type="button"
+                onClick={scanning ? stopScanner : startScanner}
+                aria-pressed={scanning}
+                aria-label={scanning ? "Stop scanning" : "Scan a barcode"}
+                className={`h-11 px-3 sm:px-4 rounded-xl border text-sm font-medium transition-colors inline-flex items-center gap-2 ${focusRing} ${
+                  scanning
+                    ? "border-[#7a947c] bg-[#7a947c] text-white"
+                    : "border-[#7a947c]/50 text-[#4a5c4b] hover:bg-[#7a947c]/10"
+                }`}
+              >
+                <BarcodeIcon />
+                <span className="hidden sm:inline">{scanning ? "Stop" : "Scan"}</span>
+              </button>
+              <button
                 type="submit"
                 disabled={searching}
-                className={`h-11 px-5 rounded-xl bg-[#0f172a] text-[#Fdfaf3] text-sm font-medium hover:bg-[#7a947c] disabled:opacity-50 transition-colors inline-flex items-center gap-2 ${focusRing}`}
+                className={`h-11 px-4 sm:px-5 rounded-xl bg-[#0f172a] text-[#Fdfaf3] text-sm font-medium hover:bg-[#7a947c] disabled:opacity-50 transition-colors inline-flex items-center gap-2 ${focusRing}`}
               >
                 {searching && <Spinner />}
                 {searching ? "Searching" : "Search"}
@@ -668,14 +874,144 @@ export default function WishlistPage() {
             </div>
           </form>
 
-          {searchError && (
+          {/* ---------------- Camera ----------------
+              The video element stays mounted (just hidden) so it always
+              exists when ZXing attaches the stream, like the library page. */}
+          <div className={scanning ? "mt-5 space-y-3" : "hidden"} aria-hidden={!scanning}>
+            <div className="relative overflow-hidden rounded-2xl bg-[#0f172a] aspect-[4/3] sm:aspect-video">
+              <video ref={videoRef} className="w-full h-full object-cover" muted playsInline />
+
+              <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                <div className="relative w-[80%] max-w-md h-28 rounded-xl border-2 border-white/85 shadow-[0_0_0_9999px_rgba(15,23,42,0.45)] overflow-hidden">
+                  <span className="absolute left-3 right-3 top-1/2 h-0.5 bg-[#7a947c] shadow-[0_0_12px_#7a947c] animate-scan-line" />
+                </div>
+              </div>
+
+              <div className="absolute bottom-3 inset-x-0 text-center px-4">
+                <span className="inline-block bg-[#0f172a]/80 text-white text-xs px-4 py-2 rounded-full">
+                  Line up the barcode on the back cover inside the frame
+                </span>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={stopScanner}
+              tabIndex={scanning ? 0 : -1}
+              className={`w-full h-11 border border-slate-200 text-slate-600 rounded-xl hover:border-[#0f172a] hover:text-[#0f172a] transition-all ${focusRing}`}
+            >
+              Stop camera
+            </button>
+          </div>
+
+          {scannerError && (
             <p role="alert" className="mt-4 text-sm text-[#a14e43]">
-              {searchError}
+              {scannerError}
             </p>
           )}
 
-          {/* Results */}
-          {results && results.length > 0 && (
+          {searchError && (
+            <div className="mt-4 flex flex-col sm:flex-row sm:items-center gap-3">
+              <p role="alert" className="flex-1 text-sm text-[#a14e43]">
+                {searchError}
+              </p>
+              {fromScan && (
+                <button
+                  type="button"
+                  onClick={startScanner}
+                  className={`shrink-0 h-10 px-5 rounded-full border border-[#7a947c] text-[#4a5c4b] text-sm font-medium hover:bg-[#7a947c] hover:text-white transition-colors ${focusRing}`}
+                >
+                  Scan another
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* ---------------- Single ISBN verdict ---------------- */}
+          {singleResult && (() => {
+            const r = singleResult;
+            const key = resultKey(r);
+            const owned = libraryMatch(r);
+            const listed = wishlistMatch(r);
+            const adding = addingKey === key;
+
+            const verdict =
+              owned === "exact"
+                ? { tone: "owned", title: "You already own this", body: "This exact edition is in your library." }
+                : owned === "edition"
+                ? { tone: "owned", title: "You own another edition", body: "It's in your library with a different ISBN." }
+                : listed === "exact"
+                ? { tone: "listed", title: "Already on your wishlist", body: "You've been hoping to get this one." }
+                : listed === "edition"
+                ? { tone: "listed", title: "Another edition is on your wishlist", body: "You wished for a different edition of this book." }
+                : { tone: "new", title: "Not in your library", body: "You don't have this book yet." };
+
+            const toneClass =
+              verdict.tone === "owned"
+                ? "bg-[#eef3ee] border-[#7a947c]/30"
+                : verdict.tone === "listed"
+                ? "bg-[#d8d0e3]/35 border-[#9a86b9]/30"
+                : "bg-[#Fdfaf3] border-[#0f172a]/10";
+
+            const canAdd = listed !== "exact" && owned !== "exact";
+
+            return (
+              <div className={`mt-6 rounded-2xl border p-4 sm:p-5 ${toneClass}`} aria-live="polite">
+                <div className="flex gap-4">
+                  <Cover src={r.coverUrl} title={r.title || "Untitled"} author={r.author} className="w-20 sm:w-24 shrink-0 shadow-md" />
+
+                  <div className="flex-1 min-w-0">
+                    <p className="font-classical text-xl sm:text-2xl font-semibold leading-tight">{verdict.title}</p>
+                    <p className="text-sm text-slate-600 mt-1">{verdict.body}</p>
+
+                    <div className="mt-3">
+                      <p className="font-medium leading-snug line-clamp-2">{r.title}</p>
+                      <p className="text-sm text-slate-500 truncate">
+                        {[r.author, yearOf(r.publishedDate)].filter(Boolean).join(", ")}
+                      </p>
+                      {(r.isbn13 || r.isbn10) && (
+                        <p className="text-xs text-slate-400 mt-0.5">ISBN {r.isbn13 || r.isbn10}</p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-4 flex flex-col sm:flex-row gap-2">
+                  {canAdd && (
+                    <button
+                      type="button"
+                      onClick={() => addToWishlist(r)}
+                      disabled={adding || !r.title}
+                      className={`h-11 px-6 rounded-full bg-[#0f172a] text-[#Fdfaf3] text-sm font-medium hover:bg-[#7a947c] disabled:opacity-50 transition-colors inline-flex items-center justify-center gap-2 ${focusRing}`}
+                    >
+                      {adding && <Spinner />}
+                      {owned === "edition" || listed === "edition" ? "Add this edition to wishlist" : "Add to wishlist"}
+                    </button>
+                  )}
+                  {fromScan && (
+                    <button
+                      type="button"
+                      onClick={startScanner}
+                      className={`h-11 px-6 rounded-full border border-[#7a947c] text-[#4a5c4b] text-sm font-medium hover:bg-[#7a947c] hover:text-white transition-colors inline-flex items-center justify-center gap-2 ${focusRing}`}
+                    >
+                      <BarcodeIcon />
+                      Scan another
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={clearSearch}
+                    className={`h-11 px-5 rounded-full text-slate-500 hover:text-[#0f172a] hover:bg-[#0f172a]/5 text-sm transition-colors ${focusRing}`}
+                  >
+                    Clear
+                  </button>
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* ---------------- Text search results ---------------- */}
+          {!singleResult && results && results.length > 0 && (
             <div className="mt-7">
               <div className="flex items-center justify-between mb-3">
                 <p className="text-sm text-slate-500" aria-live="polite">
@@ -773,6 +1109,11 @@ export default function WishlistPage() {
           )}
         </section>
 
+        {/* ---------------- Share ---------------- */}
+        <div className="mb-12">
+          <ShareWishlistCard userId={userId} itemCount={items.length} />
+        </div>
+
         {/* ---------------- Wishlist ---------------- */}
         <section aria-labelledby="wishlist-heading">
           <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4 mb-6">
@@ -821,7 +1162,7 @@ export default function WishlistPage() {
               </div>
               <h3 className="font-classical text-2xl font-semibold">Nothing on your wishlist yet</h3>
               <p className="text-slate-500 text-sm max-w-sm mx-auto mt-2 leading-6">
-                Search above for a book you&apos;d like to read, then add it here.
+                Search above for a book you&apos;d like to read, or scan one in a bookshop.
               </p>
               <button
                 type="button"
@@ -1080,6 +1421,15 @@ function SearchIcon() {
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <circle cx="11" cy="11" r="7" />
       <path d="m20 20-3.5-3.5" />
+    </svg>
+  );
+}
+
+function BarcodeIcon() {
+  return (
+    <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round">
+      <path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2" />
+      <path d="M7 8v8M10 8v8M13 8v8M16 8v8" />
     </svg>
   );
 }
