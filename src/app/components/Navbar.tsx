@@ -24,7 +24,7 @@ const ACTIVITY_EVENTS = [
 const NAV_LINKS = [
     { href: "/library", label: "My Library" },
     { href: "/reading", label: "Reading" },
-    { href: "/wishlist", label: "Want to Read" },
+    { href: "/wishlist", label: "Wishlist" },
     { href: "/family", label: "Family" },
 ] as const;
 
