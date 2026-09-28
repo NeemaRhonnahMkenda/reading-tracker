@@ -1,1114 +1,1078 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 
 import Navbar from "../components/Navbar";
 import { supabase } from "../../lib/supabase";
 
+// ============================================================
+// Types
+// ============================================================
+
 interface Family {
-    id: string;
-    name: string;
-    created_by: string;
-    created_at: string;
+  id: string;
+  name: string;
+  created_by: string;
+  created_at: string;
 }
 
-interface FamilyMember {
-    id: string;
-    family_id: string;
-    user_id: string;
-    joined_at: string;
+interface Member {
+  user_id: string;
+  display_name: string;
+  joined_at: string;
 }
 
 interface Book {
-    id: string;
-    user_id: string;
-    title: string;
-    author: string | null;
-    cover_url: string | null;
-    status: string | null;
-    added_at: string | null;
-}
-
-interface FamilyBook extends Book {
-    ownerEmail?: string;
+  id: string;
+  user_id: string;
+  title: string;
+  author: string | null;
+  cover_url: string | null;
+  custom_cover_path: string | null;
+  status: string | null;
+  added_at: string | null;
+  created_at: string;
 }
 
 interface FamilyInvite {
-    id: string;
-    invited_email: string;
-    status: string;
-    created_at: string;
-    expires_at: string;
+  id: string;
+  invited_email: string;
+  status: string;
+  created_at: string;
+  expires_at: string;
 }
 
-export default function FamilyPage() {
-    const router = useRouter();
+type Notice = { type: "error" | "success"; message: string } | null;
+
+// ============================================================
+// Config
+// ============================================================
+
+const COVER_BUCKET =
+  process.env.NEXT_PUBLIC_SUPABASE_COVER_BUCKET || "book-covers";
+const SIGNED_URL_TTL = 60 * 60;
+
+const MEMBER_COLORS = ["#7a947c", "#9a86b9", "#c5a24a", "#0f172a", "#b07a6a", "#5f7f99"];
+
+const STATUS_FILTERS = [
+  { value: "all", label: "Any status" },
+  { value: "reading", label: "Reading" },
+  { value: "want_to_read", label: "Want to read" },
+  { value: "finished", label: "Finished" },
+] as const;
+
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// ============================================================
+// Helpers
+// ============================================================
+
+function statusLabel(status: string | null) {
+  switch (status) {
+    case "reading":
+      return "Reading";
+    case "finished":
+      return "Finished";
+    case "want_to_read":
+      return "Want to read";
+    default:
+      return "No status";
+  }
+}
+
+function initials(name: string) {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return "?";
+  if (parts.length === 1) return parts[0].slice(0, 1).toUpperCase();
+  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+}
+
+function formatDate(value: string) {
+  return new Date(value).toLocaleDateString("en-GB", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+  });
+}
+
+const focusRing =
+  "outline-none focus-visible:ring-2 focus-visible:ring-[#7a947c] focus-visible:ring-offset-2 focus-visible:ring-offset-[#Fdfaf3]";
+
+// ============================================================
+// Small components
+// ============================================================
+
+function Avatar({
+  name,
+  color,
+  size = "md",
+  ring = false,
+}: {
+  name: string;
+  color: string;
+  size?: "sm" | "md" | "lg";
+  ring?: boolean;
+}) {
+  const sizes = {
+    sm: "w-6 h-6 text-[10px]",
+    md: "w-10 h-10 text-sm",
+    lg: "w-12 h-12 text-base",
+  };
+
+  return (
+    <span
+      aria-hidden="true"
+      className={`${sizes[size]} rounded-full flex items-center justify-center text-white font-semibold shrink-0 ${
+        ring ? "ring-2 ring-[#Fdfaf3]" : ""
+      }`}
+      style={{ backgroundColor: color }}
+    >
+      {initials(name)}
+    </span>
+  );
+}
+
+function CoverImage({
+  sources,
+  title,
+  author,
+}: {
+  sources: string[];
+  title: string;
+  author: string | null;
+}) {
+  const [index, setIndex] = useState(0);
+  const key = sources.join("|");
 
-    const [userId, setUserId] = useState<string | null>(null);
-    const [family, setFamily] = useState<Family | null>(null);
-    const [members, setMembers] = useState<FamilyMember[]>([]);
-    const [books, setBooks] = useState<FamilyBook[]>([]);
-    const [invites, setInvites] = useState<FamilyInvite[]>([]);
+  useEffect(() => {
+    setIndex(0);
+  }, [key]);
 
-    const [loading, setLoading] = useState(true);
-    const [creatingFamily, setCreatingFamily] = useState(false);
-    const [sendingInvite, setSendingInvite] = useState(false);
+  const src = sources[index];
 
-    const [familyName, setFamilyName] = useState("");
-    const [inviteEmail, setInviteEmail] = useState("");
-
-    const [error, setError] = useState("");
-    const [success, setSuccess] = useState("");
-
-    // ============================================================
-    // LOAD FAMILY
-    // ============================================================
-
-    useEffect(() => {
-        loadFamily();
-    }, []);
-
-    async function loadFamily() {
-        setLoading(true);
-        setError("");
-
-        try {
-            // --------------------------------------------------------
-            // Get current authenticated session
-            // --------------------------------------------------------
-
-            const {
-                data: { session },
-                error: sessionError,
-            } = await supabase.auth.getSession();
-
-            if (sessionError) {
-                console.error("Session error:", sessionError);
-
-                setError("We couldn't verify your login session.");
-                return;
-            }
-
-            if (!session?.user) {
-                router.push("/login");
-                return;
-            }
-
-            const currentUserId = session.user.id;
-
-            setUserId(currentUserId);
-
-            // --------------------------------------------------------
-            // Find the current user's family membership
-            // --------------------------------------------------------
-
-            const {
-                data: membership,
-                error: membershipError,
-            } = await supabase
-                .from("family_members")
-                .select("id, family_id, user_id, joined_at")
-                .eq("user_id", currentUserId)
-                .limit(1)
-                .maybeSingle();
-
-            if (membershipError) {
-                console.error(
-                    "Family membership query failed:",
-                    membershipError
-                );
-
-                console.error(
-                    "Membership error details:",
-                    JSON.stringify(
-                        membershipError,
-                        Object.getOwnPropertyNames(membershipError),
-                        2
-                    )
-                );
-
-                setFamily(null);
-                setMembers([]);
-                setBooks([]);
-                setInvites([]);
-
-                setError(
-                    "We couldn't check your family membership. Please make sure the family database policies have been set up correctly."
-                );
-
-                return;
-            }
-
-            // --------------------------------------------------------
-            // No membership means the user can create a family
-            // --------------------------------------------------------
-
-            if (!membership) {
-                setFamily(null);
-                setMembers([]);
-                setBooks([]);
-                setInvites([]);
-
-                return;
-            }
-
-            const {
-                data: familyData,
-                error: familyError,
-            } = await supabase
-                .from("families")
-                .select("*")
-                .eq("id", membership.family_id)
-                .single();
-
-            if (familyError) {
-                console.error("Error loading family:", familyError);
-
-                setError(
-                    `We couldn't load your family. ${familyError.message || ""
-                    }`
-                );
-
-                return;
-            }
-
-            if (!familyData) {
-                setFamily(null);
-                setMembers([]);
-                setBooks([]);
-                setInvites([]);
-
-                return;
-            }
-
-            setFamily(familyData);
-
-            // --------------------------------------------------------
-            // Get family members
-            // --------------------------------------------------------
-
-            const {
-                data: membersData,
-                error: membersError,
-            } = await supabase
-                .from("family_members")
-                .select("id, family_id, user_id, joined_at")
-                .eq("family_id", membership.family_id)
-                .order("joined_at", {
-                    ascending: true,
-                });
-
-            if (membersError) {
-                console.error(
-                    "Error loading family members:",
-                    membersError
-                );
-
-                setError(
-                    `We couldn't load your family members. ${membersError.message || ""
-                    }`
-                );
-
-                return;
-            }
-
-            const safeMembers = membersData || [];
-
-            setMembers(safeMembers);
-
-            // --------------------------------------------------------
-            // Get books belonging to family members
-            // --------------------------------------------------------
-
-            const memberIds = safeMembers.map(
-                (member) => member.user_id
-            );
-
-            if (memberIds.length > 0) {
-                const {
-                    data: booksData,
-                    error: booksError,
-                } = await supabase
-                    .from("books")
-                    .select(`
-                        id,
-                        user_id,
-                        title,
-                        author,
-                        cover_url,
-                        status,
-                        added_at
-                    `)
-                    .in("user_id", memberIds)
-                    .order("added_at", {
-                        ascending: false,
-                    });
-
-                if (booksError) {
-                    console.error(
-                        "Error loading family books:",
-                        booksError
-                    );
-
-                    setError(
-                        `We couldn't load the shared library. ${booksError.message || ""
-                        }`
-                    );
-
-                    return;
-                }
-
-                setBooks(booksData || []);
-            } else {
-                setBooks([]);
-            }
-
-            // --------------------------------------------------------
-            // Get pending invitations
-            // --------------------------------------------------------
-
-            const {
-                data: invitesData,
-                error: invitesError,
-            } = await supabase
-                .from("family_invites")
-                .select(`
-                    id,
-                    invited_email,
-                    status,
-                    created_at,
-                    expires_at
-                `)
-                .eq("family_id", membership.family_id)
-                .eq("status", "pending")
-                .order("created_at", {
-                    ascending: false,
-                });
-
-            if (invitesError) {
-                console.error(
-                    "Error loading invitations:",
-                    invitesError
-                );
-
-                // Invitations should not prevent the family
-                // library from loading.
-                setInvites([]);
-            } else {
-                setInvites(invitesData || []);
-            }
-        } catch (error) {
-            console.error("Unexpected family error:", error);
-
-            setError(
-                "Something went wrong while loading your family."
-            );
-        } finally {
-            setLoading(false);
-        }
-    }
-
-    // ============================================================
-    // CREATE FAMILY
-    // ============================================================
-
-    async function createFamily() {
-        const trimmedFamilyName = familyName.trim();
-
-        if (!trimmedFamilyName) {
-            setError("Please enter a family name.");
-            return;
-        }
-
-        setCreatingFamily(true);
-        setError("");
-        setSuccess("");
-
-        try {
-            const {
-                data: { user },
-                error: userError,
-            } = await supabase.auth.getUser();
-
-            if (userError) {
-                console.error(
-                    "Error getting authenticated user:",
-                    userError
-                );
-
-                setError(
-                    `Could not verify your login: ${userError.message || "Unknown error"
-                    }`
-                );
-
-                return;
-            }
-
-            if (!user) {
-                setError(
-                    "You need to be logged in to create a family."
-                );
-
-                router.push("/login");
-                return;
-            }
-
-            const currentUserId = user.id;
-
-            setUserId(currentUserId);
-
-            const newFamilyId = crypto.randomUUID();
-
-            const { error: familyError } = await supabase
-                .from("families")
-                .insert({
-                    id: newFamilyId,
-                    name: trimmedFamilyName,
-                    created_by: currentUserId,
-                });
-
-            if (familyError) {
-                console.error(
-                    "Error creating family:",
-                    familyError
-                );
-
-                console.error(
-                    "Family error details:",
-                    JSON.stringify(
-                        familyError,
-                        Object.getOwnPropertyNames(familyError),
-                        2
-                    )
-                );
-
-                setError(
-                    `Could not create family: ${familyError.message || "Unknown error"
-                    }`
-                );
-
-                return;
-            }
-
-            const { error: memberError } = await supabase
-                .from("family_members")
-                .insert({
-                    family_id: newFamilyId,
-                    user_id: currentUserId,
-                });
-
-            if (memberError) {
-                console.error(
-                    "Error adding family creator:",
-                    memberError
-                );
-
-                console.error(
-                    "Member error details:",
-                    JSON.stringify(
-                        memberError,
-                        Object.getOwnPropertyNames(memberError),
-                        2
-                    )
-                );
-
-                const { error: cleanupError } = await supabase
-                    .from("families")
-                    .delete()
-                    .eq("id", newFamilyId)
-                    .eq("created_by", currentUserId);
-
-                if (cleanupError) {
-                    console.error(
-                        "Could not clean up incomplete family:",
-                        cleanupError
-                    );
-                }
-
-                setError(
-                    `Could not finish creating your family: ${memberError.message || "Unknown error"
-                    }`
-                );
-
-                return;
-            }
-
-            // --------------------------------------------------------
-            // Everything succeeded.
-            // --------------------------------------------------------
-
-            setFamilyName("");
-
-            setSuccess(
-                "Your family has been created successfully."
-            );
-
-            await loadFamily();
-        } catch (error) {
-            console.error(
-                "Unexpected family creation error:",
-                error
-            );
-
-            setError(
-                "Something went wrong while creating the family."
-            );
-        } finally {
-            setCreatingFamily(false);
-        }
-    }
-
-    // ============================================================
-    // CREATE INVITATION
-    // ============================================================
-
-    async function sendInvite() {
-        if (!inviteEmail.trim()) {
-            setError("Please enter an email address.");
-            return;
-        }
-
-        if (!family) {
-            setError("You need to create a family first.");
-            return;
-        }
-
-        if (!userId) {
-            setError("You need to be logged in.");
-            return;
-        }
-
-        const email = inviteEmail.trim().toLowerCase();
-
-        const emailRegex =
-            /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-        if (!emailRegex.test(email)) {
-            setError("Please enter a valid email address.");
-            return;
-        }
-
-        setSendingInvite(true);
-        setError("");
-        setSuccess("");
-
-        try {
-            // --------------------------------------------------------
-            // Verify the authenticated user
-            // --------------------------------------------------------
-
-            const {
-                data: { user },
-                error: userError,
-            } = await supabase.auth.getUser();
-
-            if (userError || !user) {
-                console.error(
-                    "Could not verify authenticated user:",
-                    userError
-                );
-
-                setError(
-                    "Your login session could not be verified. Please log in again."
-                );
-
-                return;
-            }
-
-            // --------------------------------------------------------
-            // Check existing pending invitation
-            // --------------------------------------------------------
-
-            const {
-                data: existingInvite,
-                error: existingInviteError,
-            } = await supabase
-                .from("family_invites")
-                .select("id")
-                .eq("family_id", family.id)
-                .eq("invited_email", email)
-                .eq("status", "pending")
-                .maybeSingle();
-
-            if (existingInviteError) {
-                console.error(
-                    "Error checking existing invitation:",
-                    existingInviteError
-                );
-
-                setError(
-                    `Could not check existing invitations: ${existingInviteError.message ||
-                    "Unknown error"
-                    }`
-                );
-
-                return;
-            }
-
-            if (existingInvite) {
-                setError(
-                    "An invitation has already been sent to this email address."
-                );
-
-                return;
-            }
-
-            // --------------------------------------------------------
-            // Generate invitation ID ourselves
-            // --------------------------------------------------------
-
-            const invitationId =
-                crypto.randomUUID();
-
-            // --------------------------------------------------------
-            // Create invitation
-            // --------------------------------------------------------
-
-            const {
-                error: inviteError,
-            } = await supabase
-                .from("family_invites")
-                .insert({
-                    id: invitationId,
-                    family_id: family.id,
-                    invited_email: email,
-                    invited_by: user.id,
-                });
-
-            if (inviteError) {
-                console.error(
-                    "Error creating invitation:",
-                    inviteError
-                );
-
-                console.error(
-                    "Invitation error details:",
-                    JSON.stringify(
-                        inviteError,
-                        Object.getOwnPropertyNames(
-                            inviteError
-                        ),
-                        2
-                    )
-                );
-
-                setError(
-                    `Could not create invitation: ${inviteError.message ||
-                    "Unknown error"
-                    }`
-                );
-
-                return;
-            }
-
-            console.log(
-                "Family invitation created:",
-                invitationId
-            );
-
-            // --------------------------------------------------------
-            // Determine inviter's display name
-            // --------------------------------------------------------
-
-            const inviterName =
-                user.user_metadata?.full_name ||
-                user.user_metadata?.name ||
-                user.email?.split("@")[0] ||
-                "A family member";
-
-            // --------------------------------------------------------
-            // Send invitation email
-            // --------------------------------------------------------
-
-            const emailResponse = await fetch(
-                "/api/family-invite",
-                {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                    },
-                    body: JSON.stringify({
-                        email,
-                        familyName: family.name,
-                        inviterName,
-                        inviteId: invitationId,
-                    }),
-                }
-            );
-
-            let emailResult: {
-                success?: boolean;
-                emailId?: string | null;
-                error?: string;
-            } | null = null;
-
-            try {
-                emailResult =
-                    await emailResponse.json();
-            } catch {
-                emailResult = null;
-            }
-
-            // --------------------------------------------------------
-            // Email failed
-            // --------------------------------------------------------
-
-            if (
-                !emailResponse.ok ||
-                !emailResult?.success
-            ) {
-                console.error(
-                    "Invitation email failed:",
-                    emailResult
-                );
-
-                setError(
-                    emailResult?.error ||
-                    "The invitation was created, but we couldn't send the email."
-                );
-
-                return;
-            }
-
-            // --------------------------------------------------------
-            // Everything succeeded
-            // --------------------------------------------------------
-
-            setInviteEmail("");
-
-            setSuccess(
-                `Invitation sent successfully to ${email}.`
-            );
-
-            await loadFamily();
-        } catch (error) {
-            console.error(
-                "Unexpected invitation error:",
-                error
-            );
-
-            setError(
-                "Something went wrong while sending the invitation."
-            );
-        } finally {
-            setSendingInvite(false);
-        }
-    }
-
-    // ============================================================
-    // STATUS LABEL
-    // ============================================================
-
-    function getStatusLabel(status: string | null) {
-        switch (status) {
-            case "want_to_read":
-                return "Want to Read";
-
-            case "reading":
-                return "Reading";
-
-            case "finished":
-                return "Finished";
-
-            default:
-                return "Not Set";
-        }
-    }
-
-    // ============================================================
-    // LOADING
-    // ============================================================
-
-    if (loading) {
-        return (
-            <main className="min-h-screen bg-[#Fdfaf3] text-[#0f172a]">
-                <Navbar />
-
-                <div className="max-w-6xl mx-auto px-5 sm:px-8 py-20">
-                    <div className="text-center">
-                        <p className="text-slate-500">
-                            Loading your family...
-                        </p>
-                    </div>
-                </div>
-            </main>
-        );
-    }
-
-    // ============================================================
-    // NO FAMILY
-    // ============================================================
-
-    if (!family) {
-        return (
-            <main className="min-h-screen bg-[#Fdfaf3] text-[#0f172a]">
-                <style jsx global>{`
-                    @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;500;600;700&display=swap');
-
-                    .font-classical {
-                        font-family: "Playfair Display", serif;
-                    }
-                `}</style>
-
-                <Navbar isLoggedIn={!!userId} />
-
-                <section className="max-w-3xl mx-auto px-5 sm:px-8 py-12 sm:py-20">
-                    <div className="text-center mb-12">
-                        <p className="text-sm uppercase tracking-[0.2em] text-[#7a947c] font-medium mb-4">
-                            Shared Reading
-                        </p>
-
-                        <h1 className="font-classical text-4xl sm:text-5xl font-semibold mb-5">
-                            Create your family library
-                        </h1>
-
-                        <p className="text-slate-600 max-w-xl mx-auto leading-relaxed">
-                            Create a shared space for the people you
-                            read with. Everyone keeps their own personal
-                            library, while family members can discover
-                            and read each other's books.
-                        </p>
-                    </div>
-
-                    <div className="bg-white rounded-3xl shadow-sm border border-slate-100 p-6 sm:p-10">
-                        <h2 className="font-classical text-2xl font-semibold mb-2">
-                            Create a family
-                        </h2>
-
-                        <p className="text-slate-500 text-sm mb-6">
-                            Give your family library a name.
-                        </p>
-
-                        <input
-                            type="text"
-                            value={familyName}
-                            onChange={(event) =>
-                                setFamilyName(event.target.value)
-                            }
-                            onKeyDown={(event) => {
-                                if (event.key === "Enter") {
-                                    createFamily();
-                                }
-                            }}
-                            placeholder="e.g. The Smith Family"
-                            className="w-full px-4 py-3.5 rounded-xl border border-slate-200 bg-[#Fdfaf3] text-[#0f172a] outline-none focus:border-[#7a947c] transition-colors"
-                        />
-
-                        {error && (
-                            <div className="mt-4 p-4 rounded-xl bg-red-50 text-red-700 text-sm">
-                                {error}
-                            </div>
-                        )}
-
-                        {success && (
-                            <div className="mt-4 p-4 rounded-xl bg-green-50 text-green-700 text-sm">
-                                {success}
-                            </div>
-                        )}
-
-                        <button
-                            type="button"
-                            onClick={createFamily}
-                            disabled={creatingFamily}
-                            className="mt-6 w-full sm:w-auto px-6 py-3.5 rounded-xl bg-[#7a947c] text-white font-medium hover:bg-[#6b826c] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                        >
-                            {creatingFamily
-                                ? "Creating..."
-                                : "Create Family"}
-                        </button>
-                    </div>
-                </section>
-            </main>
-        );
-    }
-
-    // ============================================================
-    // FAMILY LIBRARY
-    // ============================================================
-
+  if (src) {
     return (
-        <main className="min-h-screen bg-[#Fdfaf3] text-[#0f172a]">
-            <style jsx global>{`
-                @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;500;600;700&display=swap');
-
-                .font-classical {
-                    font-family: "Playfair Display", serif;
-                }
-            `}</style>
-
-            <Navbar isLoggedIn={!!userId} />
-
-            <section className="max-w-6xl mx-auto px-5 sm:px-8 pb-20">
-
-                {/* ================================================== */}
-                {/* HEADER */}
-                {/* ================================================== */}
-
-                <div className="pt-6 sm:pt-10 pb-10">
-                    <p className="text-sm uppercase tracking-[0.2em] text-[#7a947c] font-medium mb-3">
-                        Shared Library
-                    </p>
-
-                    <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-6">
-                        <div>
-                            <h1 className="font-classical text-4xl sm:text-5xl font-semibold mb-4">
-                                {family.name}
-                            </h1>
-
-                            <p className="text-slate-500">
-                                {members.length}{" "}
-                                {members.length === 1
-                                    ? "member"
-                                    : "members"}{" "}
-                                · {books.length}{" "}
-                                {books.length === 1
-                                    ? "book"
-                                    : "books"}
-                            </p>
-                        </div>
-                    </div>
-                </div>
-
-                {/* ================================================== */}
-                {/* MESSAGES */}
-                {/* ================================================== */}
-
-                {error && (
-                    <div className="mb-6 p-4 rounded-xl bg-red-50 text-red-700 text-sm">
-                        {error}
-                    </div>
-                )}
-
-                {success && (
-                    <div className="mb-6 p-4 rounded-xl bg-green-50 text-green-700 text-sm">
-                        {success}
-                    </div>
-                )}
-
-                {/* ================================================== */}
-                {/* MEMBERS + INVITE */}
-                {/* ================================================== */}
-
-                <div className="grid lg:grid-cols-[1fr_1.3fr] gap-6 mb-12">
-
-                    {/* MEMBERS */}
-
-                    <div className="bg-white rounded-3xl border border-slate-100 shadow-sm p-6 sm:p-8">
-                        <div className="flex items-center justify-between mb-6">
-                            <div>
-                                <p className="text-sm text-slate-400 uppercase tracking-wider">
-                                    Family
-                                </p>
-
-                                <h2 className="font-classical text-2xl font-semibold mt-1">
-                                    Members
-                                </h2>
-                            </div>
-
-                            <div className="w-11 h-11 rounded-full bg-[#d8d0e3] flex items-center justify-center text-[#0f172a] font-classical text-lg">
-                                {members.length}
-                            </div>
-                        </div>
-
-                        <div className="space-y-3">
-                            {members.map((member) => (
-                                <div
-                                    key={member.id}
-                                    className="flex items-center gap-4 p-4 rounded-xl bg-[#Fdfaf3]"
-                                >
-                                    <div className="w-10 h-10 rounded-full bg-[#0f172a] text-white flex items-center justify-center font-classical">
-                                        {member.user_id === userId
-                                            ? "Y"
-                                            : "M"}
-                                    </div>
-
-                                    <div>
-                                        <p className="font-medium">
-                                            {member.user_id === userId
-                                                ? "You"
-                                                : "Family Member"}
-                                        </p>
-
-                                        <p className="text-xs text-slate-400">
-                                            Joined{" "}
-                                            {new Date(
-                                                member.joined_at
-                                            ).toLocaleDateString()}
-                                        </p>
-                                    </div>
-                                </div>
-                            ))}
-                        </div>
-                    </div>
-
-                    {/* INVITE */}
-
-                    <div className="bg-[#0f172a] text-white rounded-3xl shadow-sm p-6 sm:p-8">
-                        <p className="text-sm text-[#d8d0e3] uppercase tracking-wider">
-                            Grow your library
-                        </p>
-
-                        <h2 className="font-classical text-2xl font-semibold mt-1 mb-3">
-                            Invite someone
-                        </h2>
-
-                        <p className="text-slate-300 text-sm leading-relaxed mb-6">
-                            Invite a family member to join this shared
-                            library. Their personal books will remain
-                            separate while appearing here.
-                        </p>
-
-                        <div className="flex flex-col sm:flex-row gap-3">
-                            <input
-                                type="email"
-                                value={inviteEmail}
-                                onChange={(event) =>
-                                    setInviteEmail(event.target.value)
-                                }
-                                onKeyDown={(event) => {
-                                    if (event.key === "Enter") {
-                                        sendInvite();
-                                    }
-                                }}
-                                placeholder="email@example.com"
-                                className="flex-1 px-4 py-3.5 rounded-xl bg-white text-[#0f172a] outline-none placeholder:text-slate-400"
-                            />
-
-                            <button
-                                type="button"
-                                onClick={sendInvite}
-                                disabled={sendingInvite}
-                                className="px-6 py-3.5 rounded-xl bg-[#7a947c] text-white font-medium hover:bg-[#6b826c] transition-colors disabled:opacity-50"
-                            >
-                                {sendingInvite
-                                    ? "Sending..."
-                                    : "Invite"}
-                            </button>
-                        </div>
-
-                        {/* PENDING INVITES */}
-
-                        {invites.length > 0 && (
-                            <div className="mt-8 pt-6 border-t border-white/10">
-                                <p className="text-sm text-slate-400 mb-3">
-                                    Pending invitations
-                                </p>
-
-                                <div className="space-y-2">
-                                    {invites.map((invite) => (
-                                        <div
-                                            key={invite.id}
-                                            className="flex items-center justify-between gap-4 text-sm"
-                                        >
-                                            <span className="text-slate-200 truncate">
-                                                {invite.invited_email}
-                                            </span>
-
-                                            <span className="text-[#d8d0e3] text-xs shrink-0">
-                                                Pending
-                                            </span>
-                                        </div>
-                                    ))}
-                                </div>
-                            </div>
-                        )}
-                    </div>
-                </div>
-
-                {/* ================================================== */}
-                {/* SHARED BOOKS */}
-                {/* ================================================== */}
-
-                <div>
-                    <div className="flex items-end justify-between mb-6">
-                        <div>
-                            <p className="text-sm text-[#7a947c] uppercase tracking-wider">
-                                Everyone's books
-                            </p>
-
-                            <h2 className="font-classical text-3xl font-semibold mt-1">
-                                Shared Library
-                            </h2>
-                        </div>
-                    </div>
-
-                    {books.length === 0 ? (
-                        <div className="bg-white rounded-3xl border border-slate-100 p-10 text-center">
-                            <div className="w-16 h-16 mx-auto mb-5 rounded-full bg-[#d8d0e3] flex items-center justify-center">
-                                <span className="font-classical text-2xl">
-                                    A
-                                </span>
-                            </div>
-
-                            <h3 className="font-classical text-xl font-semibold mb-2">
-                                No books yet
-                            </h3>
-
-                            <p className="text-slate-500 text-sm max-w-md mx-auto">
-                                Add books to your personal library and
-                                they'll appear here for your family to
-                                discover.
-                            </p>
-                        </div>
-                    ) : (
-                        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-5">
-                            {books.map((book) => (
-                                <div
-                                    key={book.id}
-                                    className="bg-white rounded-2xl overflow-hidden border border-slate-100 shadow-sm hover:shadow-md transition-shadow"
-                                >
-                                    {/* COVER */}
-
-                                    <div className="aspect-[2/3] bg-[#d8d0e3] relative">
-                                        {book.cover_url ? (
-                                            <img
-                                                src={book.cover_url}
-                                                alt={book.title}
-                                                className="w-full h-full object-cover"
-                                            />
-                                        ) : (
-                                            <div className="w-full h-full flex items-center justify-center p-5 text-center">
-                                                <span className="font-classical text-lg text-[#0f172a]">
-                                                    {book.title}
-                                                </span>
-                                            </div>
-                                        )}
-                                    </div>
-
-                                    {/* DETAILS */}
-
-                                    <div className="p-4">
-                                        <h3 className="font-classical font-semibold leading-snug line-clamp-2">
-                                            {book.title}
-                                        </h3>
-
-                                        {book.author && (
-                                            <p className="text-sm text-slate-500 mt-1 line-clamp-1">
-                                                {book.author}
-                                            </p>
-                                        )}
-
-                                        <div className="mt-3 flex items-center justify-between gap-2">
-                                            <span className="text-xs text-slate-400">
-                                                {getStatusLabel(
-                                                    book.status
-                                                )}
-                                            </span>
-
-                                            <span className="text-xs px-2 py-1 rounded-full bg-[#Fdfaf3] text-[#7a947c]">
-                                                {book.user_id === userId
-                                                    ? "Your book"
-                                                    : "Family book"}
-                                            </span>
-                                        </div>
-                                    </div>
-                                </div>
-                            ))}
-                        </div>
-                    )}
-                </div>
-            </section>
-        </main>
+      <img
+        src={src}
+        alt={`Cover of ${title}`}
+        loading="lazy"
+        onError={() => setIndex((i) => i + 1)}
+        className="w-full h-full object-cover"
+      />
     );
+  }
+
+  return (
+    <div className="w-full h-full p-5 flex flex-col justify-between bg-[#0f172a] text-[#Fdfaf3]">
+      <span className="text-[10px] tracking-[0.2em] opacity-50">The Archive</span>
+      <div>
+        <p className="font-classical text-lg leading-tight line-clamp-4">{title}</p>
+        {author && <p className="text-xs opacity-70 mt-2 line-clamp-2">{author}</p>}
+      </div>
+      <span className="self-end font-classical text-xl opacity-40">A</span>
+    </div>
+  );
+}
+
+function NoticeBanner({ notice, onDismiss }: { notice: Notice; onDismiss: () => void }) {
+  if (!notice) return null;
+
+  const isError = notice.type === "error";
+
+  return (
+    <div
+      role={isError ? "alert" : "status"}
+      className={`flex items-start gap-3 px-5 py-4 rounded-2xl border text-sm ${
+        isError
+          ? "bg-[#f8e9e5] border-[#e8cbc4] text-[#a14e43]"
+          : "bg-[#eef3ee] border-[#7a947c]/25 text-[#4a5c4b]"
+      }`}
+    >
+      <span
+        aria-hidden="true"
+        className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 text-xs font-semibold text-white ${
+          isError ? "bg-[#c0675b]" : "bg-[#7a947c]"
+        }`}
+      >
+        {isError ? "!" : "✓"}
+      </span>
+      <p className="flex-1 leading-6">{notice.message}</p>
+      <button
+        type="button"
+        onClick={onDismiss}
+        aria-label="Dismiss message"
+        className={`text-lg leading-none opacity-60 hover:opacity-100 rounded ${focusRing}`}
+      >
+        ×
+      </button>
+    </div>
+  );
+}
+
+function FontStyles() {
+  return (
+    <style
+      dangerouslySetInnerHTML={{
+        __html: `
+          @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;500;600;700&display=swap');
+          .font-classical { font-family: 'Playfair Display', Georgia, serif; }
+        `,
+      }}
+    />
+  );
+}
+
+// ============================================================
+// Page
+// ============================================================
+
+export default function FamilyPage() {
+  const router = useRouter();
+
+  const [userId, setUserId] = useState<string | null>(null);
+  const [family, setFamily] = useState<Family | null>(null);
+  const [members, setMembers] = useState<Member[]>([]);
+  const [books, setBooks] = useState<Book[]>([]);
+  const [signedCovers, setSignedCovers] = useState<Record<string, string>>({});
+  const [invites, setInvites] = useState<FamilyInvite[]>([]);
+
+  const [loading, setLoading] = useState(true);
+  const [creatingFamily, setCreatingFamily] = useState(false);
+  const [sendingInvite, setSendingInvite] = useState(false);
+
+  const [familyName, setFamilyName] = useState("");
+  const [inviteEmail, setInviteEmail] = useState("");
+
+  const [search, setSearch] = useState("");
+  const [ownerFilter, setOwnerFilter] = useState<string>("all");
+  const [statusFilter, setStatusFilter] = useState<string>("all");
+
+  const [notice, setNotice] = useState<Notice>(null);
+
+  const showError = (message: string) => setNotice({ type: "error", message });
+  const showSuccess = (message: string) => setNotice({ type: "success", message });
+
+  // ============================================================
+  // Load family
+  // ============================================================
+
+  const loadFamily = useCallback(async () => {
+    setLoading(true);
+
+    try {
+      const {
+        data: { session },
+        error: sessionError,
+      } = await supabase.auth.getSession();
+
+      if (sessionError) {
+        console.error("Session error:", sessionError.message);
+        showError("We couldn't verify your sign-in. Sign in again to continue.");
+        return;
+      }
+
+      if (!session?.user) {
+        router.push("/login");
+        return;
+      }
+
+      const currentUserId = session.user.id;
+      setUserId(currentUserId);
+
+      // ---- Membership -------------------------------------------------
+      const { data: membership, error: membershipError } = await supabase
+        .from("family_members")
+        .select("family_id")
+        .eq("user_id", currentUserId)
+        .limit(1)
+        .maybeSingle();
+
+      if (membershipError) {
+        console.error("Membership query failed:", membershipError.message);
+        showError("We couldn't check your family membership. Check the family table policies.");
+        return;
+      }
+
+      if (!membership) {
+        setFamily(null);
+        setMembers([]);
+        setBooks([]);
+        setInvites([]);
+        return;
+      }
+
+      const familyId = membership.family_id as string;
+
+      // ---- Family, members, invites in parallel -----------------------
+      const [familyResult, membersResult, invitesResult] = await Promise.all([
+        supabase.from("families").select("*").eq("id", familyId).single(),
+        supabase.rpc("family_member_profiles", { fid: familyId }),
+        supabase
+          .from("family_invites")
+          .select("id, invited_email, status, created_at, expires_at")
+          .eq("family_id", familyId)
+          .eq("status", "pending")
+          .order("created_at", { ascending: false }),
+      ]);
+
+      if (familyResult.error || !familyResult.data) {
+        console.error("Family load failed:", familyResult.error?.message);
+        showError("We couldn't load your family. Try again.");
+        return;
+      }
+
+      setFamily(familyResult.data as Family);
+
+      // Members: prefer the RPC (includes names); fall back to the table
+      let loadedMembers: Member[] = [];
+
+      if (membersResult.error) {
+        console.warn(
+          "family_member_profiles RPC unavailable, falling back:",
+          membersResult.error.message
+        );
+
+        const { data: rows, error: rowsError } = await supabase
+          .from("family_members")
+          .select("user_id, joined_at")
+          .eq("family_id", familyId)
+          .order("joined_at", { ascending: true });
+
+        if (rowsError) {
+          console.error("Members load failed:", rowsError.message);
+          showError("We couldn't load your family members. Try again.");
+          return;
+        }
+
+        loadedMembers = (rows || []).map((row, i) => ({
+          user_id: row.user_id,
+          joined_at: row.joined_at,
+          display_name: row.user_id === currentUserId ? "You" : `Member ${i + 1}`,
+        }));
+      } else {
+        loadedMembers = (membersResult.data || []) as Member[];
+      }
+
+      setMembers(loadedMembers);
+
+      if (invitesResult.error) {
+        console.error("Invites load failed:", invitesResult.error.message);
+        setInvites([]);
+      } else {
+        setInvites((invitesResult.data || []) as FamilyInvite[]);
+      }
+
+      // ---- Books for every member -------------------------------------
+      const memberIds = loadedMembers.map((m) => m.user_id);
+
+      if (memberIds.length === 0) {
+        setBooks([]);
+        return;
+      }
+
+      const { data: booksData, error: booksError } = await supabase
+        .from("books")
+        .select("id, user_id, title, author, cover_url, custom_cover_path, status, added_at, created_at")
+        .in("user_id", memberIds)
+        .order("created_at", { ascending: false });
+
+      if (booksError) {
+        console.error("Family books load failed:", booksError.message);
+        showError("We couldn't load the shared library. Try again.");
+        return;
+      }
+
+      const loadedBooks = (booksData || []) as Book[];
+      setBooks(loadedBooks);
+
+      // Diagnostic: RLS silently filters rows rather than erroring
+      const owners = new Set(loadedBooks.map((b) => b.user_id));
+      if (memberIds.length > 1 && owners.size <= 1) {
+        console.warn(
+          "Only your own books were returned. If other members have books, the books SELECT policy is not allowing family access."
+        );
+      }
+
+      // Signed URLs for custom covers
+      const paths = Array.from(
+        new Set(loadedBooks.map((b) => b.custom_cover_path).filter((p): p is string => !!p))
+      );
+
+      if (paths.length > 0) {
+        const { data: signed, error: signError } = await supabase.storage
+          .from(COVER_BUCKET)
+          .createSignedUrls(paths, SIGNED_URL_TTL);
+
+        if (signError) {
+          console.error("Cover signing failed:", signError.message);
+        } else if (signed) {
+          const map: Record<string, string> = {};
+          signed.forEach((item) => {
+            if (item.path && item.signedUrl) map[item.path] = item.signedUrl;
+          });
+          setSignedCovers(map);
+        }
+      }
+    } catch (err) {
+      console.error("Unexpected family error:", err);
+      showError("Something went wrong while loading your family.");
+    } finally {
+      setLoading(false);
+    }
+  }, [router]);
+
+  useEffect(() => {
+    loadFamily();
+  }, [loadFamily]);
+
+  // ============================================================
+  // Create family
+  // ============================================================
+
+  async function createFamily(event?: FormEvent) {
+    event?.preventDefault();
+
+    const name = familyName.trim();
+
+    if (!name) {
+      showError("Enter a name for your family library.");
+      return;
+    }
+
+    setCreatingFamily(true);
+    setNotice(null);
+
+    try {
+      const {
+        data: { user },
+        error: userError,
+      } = await supabase.auth.getUser();
+
+      if (userError || !user) {
+        router.push("/login");
+        return;
+      }
+
+      const newFamilyId = crypto.randomUUID();
+
+      const { error: familyError } = await supabase.from("families").insert({
+        id: newFamilyId,
+        name,
+        created_by: user.id,
+      });
+
+      if (familyError) {
+        console.error("Family create failed:", familyError.message);
+        showError("Your family couldn't be created. Try again.");
+        return;
+      }
+
+      const { error: memberError } = await supabase.from("family_members").insert({
+        family_id: newFamilyId,
+        user_id: user.id,
+      });
+
+      if (memberError) {
+        console.error("Adding creator failed:", memberError.message);
+
+        await supabase.from("families").delete().eq("id", newFamilyId).eq("created_by", user.id);
+
+        showError("Your family couldn't be set up. Try again.");
+        return;
+      }
+
+      setFamilyName("");
+      await loadFamily();
+      showSuccess(`${name} is ready. Invite someone to start sharing books.`);
+    } catch (err) {
+      console.error("Unexpected family creation error:", err);
+      showError("Something went wrong while creating the family.");
+    } finally {
+      setCreatingFamily(false);
+    }
+  }
+
+  // ============================================================
+  // Send invitation
+  // ============================================================
+
+  async function sendInvite(event?: FormEvent) {
+    event?.preventDefault();
+
+    if (!family || !userId) return;
+
+    const email = inviteEmail.trim().toLowerCase();
+
+    if (!email) {
+      showError("Enter an email address to send an invitation.");
+      return;
+    }
+
+    if (!EMAIL_PATTERN.test(email)) {
+      showError("That email address doesn't look right. Check it and try again.");
+      return;
+    }
+
+    setSendingInvite(true);
+    setNotice(null);
+
+    try {
+      const {
+        data: { user },
+        error: userError,
+      } = await supabase.auth.getUser();
+
+      if (userError || !user) {
+        showError("Your sign-in has expired. Sign in again to send invitations.");
+        return;
+      }
+
+      const { data: existingInvite, error: existingError } = await supabase
+        .from("family_invites")
+        .select("id")
+        .eq("family_id", family.id)
+        .eq("invited_email", email)
+        .eq("status", "pending")
+        .maybeSingle();
+
+      if (existingError) {
+        console.error("Invite check failed:", existingError.message);
+        showError("We couldn't check existing invitations. Try again.");
+        return;
+      }
+
+      if (existingInvite) {
+        showError(`${email} already has a pending invitation.`);
+        return;
+      }
+
+      const invitationId = crypto.randomUUID();
+
+      const { error: inviteError } = await supabase.from("family_invites").insert({
+        id: invitationId,
+        family_id: family.id,
+        invited_email: email,
+        invited_by: user.id,
+      });
+
+      if (inviteError) {
+        console.error("Invite create failed:", inviteError.message);
+        showError("The invitation couldn't be created. Try again.");
+        return;
+      }
+
+      const inviterName =
+        user.user_metadata?.full_name ||
+        user.user_metadata?.name ||
+        user.email?.split("@")[0] ||
+        "A family member";
+
+      const response = await fetch("/api/family-invite", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email,
+          familyName: family.name,
+          inviterName,
+          inviteId: invitationId,
+        }),
+      });
+
+      let result: { success?: boolean; error?: string } | null = null;
+      try {
+        result = await response.json();
+      } catch {
+        result = null;
+      }
+
+      if (!response.ok || !result?.success) {
+        console.error("Invite email failed:", result);
+        showError("The invitation was saved, but the email didn't send. Try sending it again later.");
+        await loadFamily();
+        return;
+      }
+
+      setInviteEmail("");
+      await loadFamily();
+      showSuccess(`Invitation sent to ${email}.`);
+    } catch (err) {
+      console.error("Unexpected invitation error:", err);
+      showError("Something went wrong while sending the invitation.");
+    } finally {
+      setSendingInvite(false);
+    }
+  }
+
+  // ============================================================
+  // Derived data
+  // ============================================================
+
+  const memberMeta = useMemo(() => {
+    const map: Record<string, { name: string; color: string }> = {};
+    members.forEach((member, i) => {
+      map[member.user_id] = {
+        name: member.user_id === userId ? "You" : member.display_name,
+        color: MEMBER_COLORS[i % MEMBER_COLORS.length],
+      };
+    });
+    return map;
+  }, [members, userId]);
+
+  const bookCountByOwner = useMemo(() => {
+    const counts: Record<string, number> = {};
+    books.forEach((b) => {
+      counts[b.user_id] = (counts[b.user_id] || 0) + 1;
+    });
+    return counts;
+  }, [books]);
+
+  const searchTerm = search.trim().toLowerCase();
+
+  const filteredBooks = books.filter((book) => {
+    const matchesOwner = ownerFilter === "all" || book.user_id === ownerFilter;
+    const matchesStatus = statusFilter === "all" || book.status === statusFilter;
+    const matchesSearch =
+      !searchTerm ||
+      book.title.toLowerCase().includes(searchTerm) ||
+      (book.author || "").toLowerCase().includes(searchTerm);
+    return matchesOwner && matchesStatus && matchesSearch;
+  });
+
+  function coverSources(book: Book) {
+    const sources: string[] = [];
+    if (book.custom_cover_path && signedCovers[book.custom_cover_path]) {
+      sources.push(signedCovers[book.custom_cover_path]);
+    }
+    if (book.cover_url) sources.push(book.cover_url);
+    return sources;
+  }
+
+  // ============================================================
+  // Loading
+  // ============================================================
+
+  if (loading) {
+    return (
+      <main className="min-h-screen bg-[#Fdfaf3] text-[#0f172a]">
+        <FontStyles />
+        <Navbar isLoggedIn={!!userId} />
+        <div className="max-w-6xl mx-auto px-5 sm:px-8 py-12" aria-busy="true" aria-label="Loading your family">
+          <div className="animate-pulse">
+            <div className="h-4 w-32 bg-slate-900/10 rounded-full mb-5" />
+            <div className="h-12 w-72 bg-slate-900/10 rounded-xl mb-12" />
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-6">
+              {Array.from({ length: 8 }).map((_, i) => (
+                <div key={i} className="aspect-[2/3] rounded-xl bg-slate-900/10" />
+              ))}
+            </div>
+          </div>
+        </div>
+      </main>
+    );
+  }
+
+  // ============================================================
+  // No family yet
+  // ============================================================
+
+  if (!family) {
+    return (
+      <main className="min-h-screen bg-[#Fdfaf3] text-[#0f172a] relative overflow-x-clip">
+        <FontStyles />
+        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-[800px] h-[480px] bg-[#d8d0e3]/25 rounded-full blur-[120px] -z-10 pointer-events-none" />
+
+        <Navbar isLoggedIn={!!userId} />
+
+        <section className="max-w-2xl mx-auto px-5 sm:px-8 py-12 sm:py-20">
+          <div className="text-center mb-10">
+            <div className="flex justify-center -space-x-3 mb-7" aria-hidden="true">
+              {MEMBER_COLORS.slice(0, 4).map((color, i) => (
+                <span
+                  key={color}
+                  className="w-12 h-16 rounded-md shadow-md ring-2 ring-[#Fdfaf3]"
+                  style={{ backgroundColor: color, transform: `rotate(${(i - 1.5) * 6}deg)` }}
+                />
+              ))}
+            </div>
+
+            <h1 className="font-classical text-4xl sm:text-5xl font-semibold leading-tight">
+              Start a family library
+            </h1>
+
+            <p className="text-slate-600 max-w-lg mx-auto leading-7 mt-5 font-light text-lg">
+              Everyone keeps their own shelves. Together, you can see every book the family owns.
+            </p>
+          </div>
+
+          <form
+            onSubmit={createFamily}
+            className="bg-white rounded-3xl shadow-[0_15px_45px_rgba(15,23,42,0.06)] border border-[#0f172a]/5 p-6 sm:p-9"
+          >
+            <label htmlFor="family-name" className="block text-sm font-medium text-slate-700 mb-2">
+              Family name
+            </label>
+
+            <input
+              id="family-name"
+              type="text"
+              value={familyName}
+              maxLength={60}
+              autoComplete="off"
+              onChange={(e) => setFamilyName(e.target.value)}
+              placeholder="The Otieno Family"
+              className="w-full h-12 px-4 rounded-xl border border-slate-200 bg-[#Fdfaf3] text-[#0f172a] placeholder:text-slate-400 focus:outline-none focus:border-[#7a947c] focus:ring-4 focus:ring-[#7a947c]/15 transition-all"
+            />
+
+            <p className="text-xs text-slate-400 mt-2">You can invite people once it&apos;s created.</p>
+
+            <div className="mt-5" aria-live="polite">
+              <NoticeBanner notice={notice} onDismiss={() => setNotice(null)} />
+            </div>
+
+            <button
+              type="submit"
+              disabled={creatingFamily}
+              className={`mt-6 w-full h-12 rounded-full bg-[#0f172a] text-[#Fdfaf3] font-medium hover:bg-[#7a947c] transition-colors disabled:opacity-50 disabled:cursor-wait inline-flex items-center justify-center gap-2 ${focusRing}`}
+            >
+              {creatingFamily && (
+                <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+              )}
+              {creatingFamily ? "Creating family…" : "Create family"}
+            </button>
+          </form>
+        </section>
+      </main>
+    );
+  }
+
+  // ============================================================
+  // Family library
+  // ============================================================
+
+  return (
+    <main className="min-h-screen bg-[#Fdfaf3] text-[#0f172a] relative overflow-x-clip">
+      <FontStyles />
+      <div className="absolute top-0 left-1/2 -translate-x-1/2 w-[900px] h-[500px] bg-[#d8d0e3]/20 rounded-full blur-[130px] -z-10 pointer-events-none" />
+      <div className="absolute top-[520px] -right-40 w-[600px] h-[600px] bg-[#89a08a]/10 rounded-full blur-[130px] -z-10 pointer-events-none" />
+
+      <Navbar isLoggedIn={!!userId} />
+
+      <section className="max-w-6xl mx-auto px-5 sm:px-8 pt-6 sm:pt-10 pb-24">
+        {/* ---------------- Header ---------------- */}
+        <header className="flex flex-col md:flex-row md:items-end md:justify-between gap-6 pb-10 mb-10 border-b border-[#0f172a]/8">
+          <div>
+            <p className="text-sm text-[#7a947c] font-medium mb-3">Family library</p>
+            <h1 className="font-classical text-4xl sm:text-5xl md:text-6xl font-semibold leading-[1.05]">
+              {family.name}
+            </h1>
+            <p className="text-slate-500 mt-4">
+              {books.length} {books.length === 1 ? "book" : "books"} across {members.length}{" "}
+              {members.length === 1 ? "shelf" : "shelves"}
+            </p>
+          </div>
+
+          <ul className="flex -space-x-2" aria-label="Family members">
+            {members.map((member) => (
+              <li key={member.user_id} title={memberMeta[member.user_id]?.name}>
+                <Avatar
+                  name={memberMeta[member.user_id]?.name || "?"}
+                  color={memberMeta[member.user_id]?.color || MEMBER_COLORS[0]}
+                  size="lg"
+                  ring
+                />
+                <span className="sr-only">{memberMeta[member.user_id]?.name}</span>
+              </li>
+            ))}
+          </ul>
+        </header>
+
+        <div className="mb-8" aria-live="polite">
+          <NoticeBanner notice={notice} onDismiss={() => setNotice(null)} />
+        </div>
+
+        <div className="grid lg:grid-cols-[minmax(0,1fr)_320px] gap-10 lg:gap-12 items-start">
+          {/* ================= Shared library ================= */}
+          <div className="min-w-0">
+            <h2 className="font-classical text-3xl font-semibold mb-6">Shared shelves</h2>
+
+            {/* Owner filter */}
+            <div className="flex gap-2 overflow-x-auto pb-2 -mx-1 px-1 mb-4" role="group" aria-label="Show books from">
+              <button
+                type="button"
+                onClick={() => setOwnerFilter("all")}
+                aria-pressed={ownerFilter === "all"}
+                className={`shrink-0 h-10 pl-4 pr-3 rounded-full text-sm inline-flex items-center gap-2 border transition-all ${focusRing} ${
+                  ownerFilter === "all"
+                    ? "bg-[#0f172a] text-[#Fdfaf3] border-[#0f172a]"
+                    : "bg-white text-slate-600 border-slate-200 hover:border-[#7a947c]"
+                }`}
+              >
+                Everyone
+                <span className={`text-xs px-1.5 rounded-full ${ownerFilter === "all" ? "bg-white/15" : "bg-slate-100"}`}>
+                  {books.length}
+                </span>
+              </button>
+
+              {members.map((member) => {
+                const meta = memberMeta[member.user_id];
+                const active = ownerFilter === member.user_id;
+                return (
+                  <button
+                    key={member.user_id}
+                    type="button"
+                    onClick={() => setOwnerFilter(member.user_id)}
+                    aria-pressed={active}
+                    className={`shrink-0 h-10 pl-1.5 pr-3 rounded-full text-sm inline-flex items-center gap-2 border transition-all ${focusRing} ${
+                      active
+                        ? "bg-[#0f172a] text-[#Fdfaf3] border-[#0f172a]"
+                        : "bg-white text-slate-600 border-slate-200 hover:border-[#7a947c]"
+                    }`}
+                  >
+                    <Avatar name={meta?.name || "?"} color={meta?.color || MEMBER_COLORS[0]} size="sm" />
+                    {meta?.name}
+                    <span className={`text-xs px-1.5 rounded-full ${active ? "bg-white/15" : "bg-slate-100"}`}>
+                      {bookCountByOwner[member.user_id] || 0}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Search + status */}
+            <div className="flex flex-col sm:flex-row gap-3 mb-8">
+              <div className="flex-1">
+                <label htmlFor="family-search" className="sr-only">
+                  Search the family library
+                </label>
+                <input
+                  id="family-search"
+                  type="search"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder="Search by title or author"
+                  className="w-full h-11 px-5 bg-white border border-slate-200 rounded-full text-sm text-slate-700 placeholder:text-slate-400 focus:outline-none focus:border-[#7a947c] focus:ring-4 focus:ring-[#7a947c]/15 transition-all"
+                />
+              </div>
+
+              <div>
+                <label htmlFor="status-filter" className="sr-only">
+                  Filter by reading status
+                </label>
+                <select
+                  id="status-filter"
+                  value={statusFilter}
+                  onChange={(e) => setStatusFilter(e.target.value)}
+                  className="w-full sm:w-auto h-11 px-4 pr-9 bg-white border border-slate-200 rounded-full text-sm text-slate-700 focus:outline-none focus:border-[#7a947c] focus:ring-4 focus:ring-[#7a947c]/15 transition-all"
+                >
+                  {STATUS_FILTERS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <p className="sr-only" aria-live="polite">
+              {filteredBooks.length} {filteredBooks.length === 1 ? "book" : "books"} shown
+            </p>
+
+            {/* Grid */}
+            {filteredBooks.length === 0 ? (
+              <div className="bg-white/70 border border-dashed border-[#0f172a]/12 rounded-3xl p-10 sm:p-14 text-center">
+                <div className="w-16 h-16 mx-auto mb-5 rounded-full bg-[#d8d0e3]/40 flex items-center justify-center">
+                  <span className="font-classical text-2xl">A</span>
+                </div>
+                <h3 className="font-classical text-2xl font-semibold">
+                  {books.length === 0 ? "The shelves are empty" : "No books match"}
+                </h3>
+                <p className="text-slate-500 text-sm max-w-sm mx-auto mt-2 leading-6">
+                  {books.length === 0
+                    ? "Books anyone in the family adds to their library will show up here."
+                    : "Change the search, pick another person, or choose a different status."}
+                </p>
+                {books.length === 0 ? (
+                  <Link
+                    href="/library"
+                    className={`inline-flex mt-6 h-11 px-6 items-center rounded-full bg-[#7a947c] text-white text-sm font-medium hover:bg-[#6b826c] transition-colors ${focusRing}`}
+                  >
+                    Add a book to your library
+                  </Link>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSearch("");
+                      setOwnerFilter("all");
+                      setStatusFilter("all");
+                    }}
+                    className={`mt-6 text-sm font-medium text-[#7a947c] hover:text-[#0f172a] underline underline-offset-4 rounded ${focusRing}`}
+                  >
+                    Clear filters
+                  </button>
+                )}
+              </div>
+            ) : (
+              <ul className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-x-5 gap-y-9">
+                {filteredBooks.map((book) => {
+                  const meta = memberMeta[book.user_id];
+                  const isMine = book.user_id === userId;
+
+                  const card = (
+                    <>
+                      <div className="relative aspect-[2/3] rounded-xl overflow-hidden bg-[#e9e4d9] shadow-md group-hover:shadow-xl group-hover:-translate-y-1 transition-all duration-300">
+                        <CoverImage sources={coverSources(book)} title={book.title} author={book.author} />
+
+                        <span className="absolute bottom-2 left-2 inline-flex items-center gap-1.5 pl-0.5 pr-2.5 py-0.5 rounded-full bg-[#Fdfaf3]/95 text-[11px] font-medium text-[#0f172a] shadow-sm">
+                          <Avatar name={meta?.name || "?"} color={meta?.color || MEMBER_COLORS[0]} size="sm" />
+                          {meta?.name || "Family"}
+                        </span>
+                      </div>
+
+                      <div className="mt-3.5">
+                        <h3 className="font-classical font-semibold text-[17px] leading-snug line-clamp-2">
+                          {book.title}
+                        </h3>
+                        {book.author && (
+                          <p className="text-sm text-slate-500 mt-1 line-clamp-1">{book.author}</p>
+                        )}
+                        <p className="text-xs text-slate-400 mt-2">{statusLabel(book.status)}</p>
+                      </div>
+                    </>
+                  );
+
+                  return (
+                    <li key={book.id}>
+                      {isMine ? (
+                        <Link
+                          href={`/library/${book.id}`}
+                          className={`group block rounded-xl ${focusRing}`}
+                          aria-label={`${book.title}, your book. Open journal and review.`}
+                        >
+                          {card}
+                        </Link>
+                      ) : (
+                        <div className="group" aria-label={`${book.title}, owned by ${meta?.name || "a family member"}`}>
+                          {card}
+                        </div>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
+
+          {/* ================= Sidebar ================= */}
+          <aside className="space-y-6 lg:sticky lg:top-28">
+            {/* Members */}
+            <section
+              aria-labelledby="members-heading"
+              className="bg-white rounded-3xl border border-[#0f172a]/5 shadow-[0_10px_35px_rgba(15,23,42,0.05)] p-6"
+            >
+              <h2 id="members-heading" className="font-classical text-2xl font-semibold mb-5">
+                Members
+              </h2>
+
+              <ul className="space-y-1">
+                {members.map((member) => {
+                  const meta = memberMeta[member.user_id];
+                  return (
+                    <li key={member.user_id}>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setOwnerFilter((current) => (current === member.user_id ? "all" : member.user_id))
+                        }
+                        aria-pressed={ownerFilter === member.user_id}
+                        className={`w-full flex items-center gap-3 p-2.5 rounded-2xl text-left transition-colors ${focusRing} ${
+                          ownerFilter === member.user_id ? "bg-[#Fdfaf3]" : "hover:bg-[#Fdfaf3]"
+                        }`}
+                      >
+                        <Avatar name={meta?.name || "?"} color={meta?.color || MEMBER_COLORS[0]} />
+                        <span className="flex-1 min-w-0">
+                          <span className="block font-medium truncate">
+                            {meta?.name}
+                            {member.user_id === family.created_by && (
+                              <span className="ml-2 text-[11px] font-normal text-[#7a947c]">Founder</span>
+                            )}
+                          </span>
+                          <span className="block text-xs text-slate-400">
+                            Joined {formatDate(member.joined_at)}
+                          </span>
+                        </span>
+                        <span className="text-xs text-slate-500 shrink-0">
+                          {bookCountByOwner[member.user_id] || 0}{" "}
+                          {(bookCountByOwner[member.user_id] || 0) === 1 ? "book" : "books"}
+                        </span>
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            </section>
+
+            {/* Invite */}
+            <section
+              aria-labelledby="invite-heading"
+              className="bg-[#0f172a] text-[#Fdfaf3] rounded-3xl shadow-[0_15px_45px_rgba(15,23,42,0.18)] p-6"
+            >
+              <h2 id="invite-heading" className="font-classical text-2xl font-semibold">
+                Invite someone
+              </h2>
+              <p className="text-sm text-slate-300 leading-6 mt-2 mb-5">
+                They keep their own library. Their books join these shelves once they accept.
+              </p>
+
+              <form onSubmit={sendInvite} className="space-y-3">
+                <label htmlFor="invite-email" className="sr-only">
+                  Email address to invite
+                </label>
+                <input
+                  id="invite-email"
+                  type="email"
+                  inputMode="email"
+                  autoComplete="email"
+                  value={inviteEmail}
+                  onChange={(e) => setInviteEmail(e.target.value)}
+                  placeholder="name@example.com"
+                  className="w-full h-12 px-4 rounded-xl bg-white/10 border border-white/15 text-white placeholder:text-slate-400 focus:outline-none focus:border-[#7a947c] focus:ring-4 focus:ring-[#7a947c]/25 transition-all"
+                />
+                <button
+                  type="submit"
+                  disabled={sendingInvite}
+                  className="w-full h-12 rounded-full bg-[#7a947c] text-white font-medium hover:bg-[#6b826c] transition-colors disabled:opacity-50 disabled:cursor-wait inline-flex items-center justify-center gap-2 outline-none focus-visible:ring-2 focus-visible:ring-[#Fdfaf3] focus-visible:ring-offset-2 focus-visible:ring-offset-[#0f172a]"
+                >
+                  {sendingInvite && (
+                    <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                  )}
+                  {sendingInvite ? "Sending invitation…" : "Send invitation"}
+                </button>
+              </form>
+
+              {invites.length > 0 && (
+                <div className="mt-6 pt-5 border-t border-white/10">
+                  <h3 className="text-sm text-slate-300 mb-3">
+                    Waiting to join ({invites.length})
+                  </h3>
+                  <ul className="space-y-2.5">
+                    {invites.map((invite) => (
+                      <li key={invite.id} className="flex items-center justify-between gap-3 text-sm">
+                        <span className="truncate text-slate-100">{invite.invited_email}</span>
+                        <span className="shrink-0 text-xs text-[#d8d0e3]">
+                          Expires {formatDate(invite.expires_at)}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </section>
+          </aside>
+        </div>
+      </section>
+    </main>
+  );
 }
