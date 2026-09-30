@@ -41,6 +41,7 @@ interface JournalEntry {
 
 type Tab = "journal" | "review";
 type SortMode = "recent" | "page";
+type BookStatus = "want_to_read" | "reading" | "finished" | "did_not_finish";
 
 type Toast = {
   type: "success" | "error";
@@ -73,6 +74,24 @@ async function sniffImageType(file: File): Promise<string | null> {
   if (ascii.startsWith("RIFF") && ascii.slice(8, 12) === "WEBP") return "image/webp";
   return null;
 }
+
+// ============================================================
+// Status
+// ============================================================
+
+const STATUS_OPTIONS: { value: BookStatus; label: string; active: string; dot: string }[] = [
+  { value: "want_to_read", label: "Want to read", active: "bg-[#d8d0e3] text-[#0f172a]", dot: "bg-[#9a86b9]" },
+  { value: "reading", label: "Reading", active: "bg-[#7a947c] text-white", dot: "bg-[#7a947c]" },
+  { value: "finished", label: "Finished", active: "bg-[#0f172a] text-[#fdfaf3]", dot: "bg-[#0f172a]" },
+  { value: "did_not_finish", label: "Did not finish", active: "bg-[#e9d6cf] text-[#7a3f33]", dot: "bg-[#b07a6a]" },
+];
+
+const STATUS_TOAST: Record<BookStatus, string> = {
+  want_to_read: "Moved to Want to read.",
+  reading: "Marked as currently reading. Enjoy!",
+  finished: "Marked as finished. Nice one.",
+  did_not_finish: "Marked as did not finish. Not every book is for everyone.",
+};
 
 // ============================================================
 // Shared helpers
@@ -148,12 +167,6 @@ function parsePage(value: string): number | null | "invalid" {
   return n;
 }
 
-const STATUS_LABEL: Record<string, string> = {
-  reading: "Currently reading",
-  finished: "Finished",
-  want_to_read: "Want to read",
-};
-
 const RATING_LABEL: Record<number, string> = {
   1: "It wasn't for me",
   2: "It was okay",
@@ -167,7 +180,6 @@ const focusRing =
 
 const fieldClass =
   "w-full h-11 px-3.5 bg-white border border-[#0f172a]/10 rounded-xl text-sm text-slate-700 placeholder:text-slate-300 focus:outline-none focus:border-[#7a947c] focus:ring-4 focus:ring-[#7a947c]/10 transition-all";
-
 
 // ============================================================
 // Cover image: tries each source in order, then shows the placeholder
@@ -206,8 +218,15 @@ function CoverImage({ sources, title, author }: { sources: string[]; title: stri
   );
 }
 
-function Spinner() {
-  return <span aria-hidden="true" className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />;
+function Spinner({ dark = false }: { dark?: boolean }) {
+  return (
+    <span
+      aria-hidden="true"
+      className={`w-4 h-4 border-2 rounded-full animate-spin ${
+        dark ? "border-[#0f172a]/20 border-t-[#0f172a]" : "border-white/30 border-t-white"
+      }`}
+    />
+  );
 }
 
 // ============================================================
@@ -226,6 +245,10 @@ export default function BookReviewPage() {
   const [journalEntries, setJournalEntries] = useState<JournalEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
+
+  // Status
+  const [savingStatus, setSavingStatus] = useState<BookStatus | null>(null);
+  const statusButtonsRef = useRef<(HTMLButtonElement | null)[]>([]);
 
   // Custom cover
   const [customCoverUrl, setCustomCoverUrl] = useState<string | null>(null);
@@ -451,6 +474,57 @@ export default function BookReviewPage() {
   const showToast = useCallback((type: "success" | "error", message: string) => {
     setToast({ type, message });
   }, []);
+
+  // ============================================================
+  // Update status (optimistic, rolls back on failure)
+  // ============================================================
+
+  async function updateStatus(next: BookStatus) {
+    if (!book || !userId || savingStatus || book.status === next) return;
+
+    const previous = book.status;
+    setBook({ ...book, status: next });
+    setSavingStatus(next);
+
+    const { error: statusError } = await supabase
+      .from("books")
+      .update({ status: next })
+      .eq("id", book.id)
+      .eq("user_id", userId);
+
+    setSavingStatus(null);
+
+    if (statusError) {
+      console.error(
+        "Status update failed:",
+        statusError.code === "23514"
+          ? "The books_status_check constraint rejected this value. Run book-status.sql."
+          : statusError.message
+      );
+      setBook((current) => (current ? { ...current, status: previous } : current));
+      showToast("error", "The status couldn't be changed. Try again.");
+      return;
+    }
+
+    showToast("success", STATUS_TOAST[next]);
+  }
+
+  // Arrow keys move between statuses, like native radio buttons
+  function onStatusKeyDown(event: ReactKeyboardEvent<HTMLButtonElement>, index: number) {
+    const keys = ["ArrowRight", "ArrowDown", "ArrowLeft", "ArrowUp", "Home", "End"];
+    if (!keys.includes(event.key)) return;
+    event.preventDefault();
+
+    const last = STATUS_OPTIONS.length - 1;
+    let nextIndex = index;
+    if (event.key === "ArrowRight" || event.key === "ArrowDown") nextIndex = index === last ? 0 : index + 1;
+    if (event.key === "ArrowLeft" || event.key === "ArrowUp") nextIndex = index === 0 ? last : index - 1;
+    if (event.key === "Home") nextIndex = 0;
+    if (event.key === "End") nextIndex = last;
+
+    statusButtonsRef.current[nextIndex]?.focus();
+    updateStatus(STATUS_OPTIONS[nextIndex].value);
+  }
 
   // ============================================================
   // Cover modal
@@ -948,6 +1022,9 @@ export default function BookReviewPage() {
 
   const hasCustomCover = !!book.custom_cover_path;
   const modalPreviewSources = coverPreview ? [coverPreview] : customCoverUrl ? [customCoverUrl] : [];
+  const currentStatusIndex = STATUS_OPTIONS.findIndex((o) => o.value === book.status);
+  const isDnf = book.status === "did_not_finish";
+  const showReviewNudge = (book.status === "finished" || isDnf) && !review;
 
   // ============================================================
   // Render
@@ -1070,12 +1147,55 @@ export default function BookReviewPage() {
           </div>
 
           <div className="lg:pt-2 min-w-0">
-            <span className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-[#f7f5fa] text-[#6c5c85] text-xs font-medium border border-[#9a86b9]/20">
-              <span aria-hidden="true" className="w-1.5 h-1.5 rounded-full bg-[#9a86b9]" />
-              {STATUS_LABEL[book.status ?? ""] ?? "Want to read"}
-            </span>
+            {/* ---------- Status picker ---------- */}
+            <div>
+              <p id="status-label" className="text-xs text-slate-400 mb-2">
+                Reading status
+              </p>
+              <div
+                role="radiogroup"
+                aria-labelledby="status-label"
+                className="inline-flex flex-wrap gap-1 p-1 rounded-2xl sm:rounded-full bg-white/70 border border-[#0f172a]/8 shadow-sm"
+              >
+                {STATUS_OPTIONS.map((option, index) => {
+                  const checked = book.status === option.value;
+                  const pending = savingStatus === option.value;
+                  // Roving tabindex: only the selected option (or the first) is tabbable
+                  const tabbable = checked || (currentStatusIndex === -1 && index === 0);
 
-            <h1 className="mt-5 text-[2.6rem] sm:text-5xl md:text-6xl xl:text-[4.2rem] font-classical font-semibold leading-[1.03] max-w-4xl break-words">
+                  return (
+                    <button
+                      key={option.value}
+                      ref={(el) => {
+                        statusButtonsRef.current[index] = el;
+                      }}
+                      type="button"
+                      role="radio"
+                      aria-checked={checked}
+                      tabIndex={tabbable ? 0 : -1}
+                      onClick={() => updateStatus(option.value)}
+                      onKeyDown={(e) => onStatusKeyDown(e, index)}
+                      disabled={!!savingStatus && !pending}
+                      className={`h-9 px-3.5 rounded-full text-xs sm:text-sm font-medium inline-flex items-center gap-2 transition-all disabled:opacity-60 ${focusRing} ${
+                        checked ? `${option.active} shadow-sm` : "text-slate-500 hover:text-[#0f172a] hover:bg-[#0f172a]/5"
+                      }`}
+                    >
+                      {pending ? (
+                        <Spinner dark={option.value === "want_to_read" || option.value === "did_not_finish"} />
+                      ) : (
+                        <span
+                          aria-hidden="true"
+                          className={`w-1.5 h-1.5 rounded-full ${checked ? "bg-current opacity-70" : option.dot}`}
+                        />
+                      )}
+                      {option.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <h1 className="mt-6 text-[2.6rem] sm:text-5xl md:text-6xl xl:text-[4.2rem] font-classical font-semibold leading-[1.03] max-w-4xl break-words">
               {book.title}
             </h1>
 
@@ -1092,7 +1212,7 @@ export default function BookReviewPage() {
                 <dd className="font-classical text-2xl mt-0.5">{journalEntries.length}</dd>
               </div>
               <div className="px-4 py-3.5">
-                <dt className="text-xs text-slate-400">Furthest page</dt>
+                <dt className="text-xs text-slate-400">{isDnf ? "Stopped at page" : "Furthest page"}</dt>
                 <dd className="font-classical text-2xl mt-0.5">{furthestPage ?? "—"}</dd>
               </div>
               <div className="px-4 py-3.5">
@@ -1110,6 +1230,19 @@ export default function BookReviewPage() {
                 </dd>
               </div>
             </dl>
+
+            {showReviewNudge && (
+              <p className="mt-5 text-sm text-slate-600">
+                {isDnf ? "Want to note why it wasn't for you?" : "You've finished it. How was it?"}{" "}
+                <button
+                  type="button"
+                  onClick={goToReview}
+                  className={`font-medium text-[#4a5c4b] underline underline-offset-4 decoration-[#7a947c]/40 hover:text-[#0f172a] rounded ${focusRing}`}
+                >
+                  Write your review
+                </button>
+              </p>
+            )}
 
             <div className="flex flex-col sm:flex-row gap-3 mt-7">
               <button
@@ -1525,7 +1658,11 @@ export default function BookReviewPage() {
                   value={reviewText}
                   onChange={(e) => setReviewText(e.target.value)}
                   onKeyDown={(e) => onSaveShortcut(e, saveReview)}
-                  placeholder="What stayed with you? The characters, the writing, the ending, a line you keep thinking about…"
+                  placeholder={
+                    isDnf
+                      ? "Why did you put it down? What didn't work for you, and was there anything you liked?"
+                      : "What stayed with you? The characters, the writing, the ending, a line you keep thinking about…"
+                  }
                   rows={12}
                   className="journal-paper journal-paper--lg w-full px-5 border border-[#0f172a]/10 rounded-2xl resize-y min-h-[300px] text-[15px] text-slate-700 placeholder:text-slate-300 focus:outline-none focus:border-[#7a947c] focus:ring-4 focus:ring-[#7a947c]/10 transition-all"
                 />

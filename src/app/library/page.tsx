@@ -56,7 +56,7 @@ const ALLOWED_COVER_TYPES: Record<string, string> = {
 };
 
 const STATUS_OPTIONS = [
-  { value: "want_to_read", label: "Want to read", hint: "On the wishlist" },
+  { value: "want_to_read", label: "Want to read", hint: "In the library" },
   { value: "reading", label: "Reading", hint: "On the nightstand" },
   { value: "finished", label: "Finished", hint: "Back on the shelf" },
 ] as const;
