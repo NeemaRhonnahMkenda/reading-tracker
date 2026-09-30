@@ -259,7 +259,9 @@ export default function BookReviewPage() {
   const [coverError, setCoverError] = useState("");
   const [savingCover, setSavingCover] = useState(false);
   const [dragOver, setDragOver] = useState(false);
-  const coverInputRef = useRef<HTMLInputElement | null>(null);
+  const [readingClipboard, setReadingClipboard] = useState(false);
+  const coverUploadRef = useRef<HTMLInputElement | null>(null); // file picker / gallery
+  const coverCameraRef = useRef<HTMLInputElement | null>(null); // opens the camera on phones
 
   // Tabs
   const [activeTab, setActiveTab] = useState<Tab>("journal");
@@ -300,8 +302,17 @@ export default function BookReviewPage() {
 
   // Keyboard hint: decided after mount so server and client HTML match
   const [saveShortcut, setSaveShortcut] = useState("Ctrl Enter");
+  const [pasteShortcut, setPasteShortcut] = useState("Ctrl V");
+  const [canReadClipboard, setCanReadClipboard] = useState(false);
+  const [isTouchDevice, setIsTouchDevice] = useState(false);
+
   useEffect(() => {
-    if (/Mac|iPhone|iPad/.test(navigator.userAgent)) setSaveShortcut("⌘ Enter");
+    if (/Mac|iPhone|iPad/.test(navigator.userAgent)) {
+      setSaveShortcut("⌘ Enter");
+      setPasteShortcut("⌘ V");
+    }
+    setCanReadClipboard(typeof navigator.clipboard?.read === "function");
+    setIsTouchDevice(window.matchMedia("(pointer: coarse)").matches);
   }, []);
 
   // ============================================================
@@ -560,7 +571,8 @@ export default function BookReviewPage() {
     setCoverPreview(null);
     setCoverError("");
     setDragOver(false);
-    if (coverInputRef.current) coverInputRef.current.value = "";
+    if (coverUploadRef.current) coverUploadRef.current.value = "";
+    if (coverCameraRef.current) coverCameraRef.current.value = "";
   }
 
   function openCoverModal() {
@@ -593,6 +605,94 @@ export default function BookReviewPage() {
     setCoverFile(file);
     setCoverFileType(realType);
     setCoverPreview(URL.createObjectURL(file));
+  }
+
+  // Clipboard images arrive as nameless blobs; give them a filename
+  function fileFromBlob(blob: Blob) {
+    const ext = ALLOWED_COVER_TYPES[blob.type] || "png";
+    return new File([blob], `pasted-cover.${ext}`, { type: blob.type || "image/png" });
+  }
+
+  // Pull the first image out of a paste event, if there is one
+  function imageFromPaste(event: ClipboardEvent): File | null {
+    const items = Array.from(event.clipboardData?.items ?? []);
+    const imageItem = items.find((item) => item.kind === "file" && item.type.startsWith("image/"));
+    const file = imageItem?.getAsFile();
+    return file ? (file.name ? file : fileFromBlob(file)) : null;
+  }
+
+  function isTypingTarget(target: EventTarget | null) {
+    const el = target as HTMLElement | null;
+    if (!el) return false;
+    return el.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName);
+  }
+
+  // Paste anywhere: inside the modal it sets the image; elsewhere on the page
+  // (when you're not typing) it opens the modal with the pasted image ready.
+  useEffect(() => {
+    function onPaste(event: ClipboardEvent) {
+      if (savingCover) return;
+
+      const file = imageFromPaste(event);
+
+      if (!file) {
+        if (showCoverModal) {
+          const text = event.clipboardData?.getData("text") ?? "";
+          if (/^https?:\/\//i.test(text.trim())) {
+            event.preventDefault();
+            setCoverError("That's a link, not an image. Right-click the picture and choose Copy image, then paste again.");
+          }
+        }
+        return;
+      }
+
+      if (!showCoverModal && isTypingTarget(event.target)) return;
+
+      event.preventDefault();
+
+      if (!showCoverModal) {
+        resetCoverSelection();
+        setShowCoverModal(true);
+      }
+
+      handleCoverFile(file);
+    }
+
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showCoverModal, savingCover]);
+
+  // "Paste image" button: reads the clipboard directly (browser asks permission)
+  async function pasteFromClipboard() {
+    if (!navigator.clipboard?.read) return;
+
+    setCoverError("");
+    setReadingClipboard(true);
+
+    try {
+      const clipboardItems = await navigator.clipboard.read();
+
+      for (const item of clipboardItems) {
+        const type = item.types.find((t) => t.startsWith("image/"));
+        if (type) {
+          const blob = await item.getType(type);
+          await handleCoverFile(fileFromBlob(blob));
+          return;
+        }
+      }
+
+      setCoverError("There's no image on your clipboard. Copy a picture first, then try again.");
+    } catch (err) {
+      const name = (err as Error)?.name;
+      setCoverError(
+        name === "NotAllowedError"
+          ? `Clipboard access was blocked. Press ${pasteShortcut} to paste instead.`
+          : "The image couldn't be pasted. Try choosing a file instead."
+      );
+    } finally {
+      setReadingClipboard(false);
+    }
   }
 
   async function saveCustomCover() {
@@ -1144,6 +1244,11 @@ export default function BookReviewPage() {
                 </div>
               </div>
             </div>
+            {!isTouchDevice && (
+              <p className="hidden lg:block mt-3 text-[11px] text-slate-400 text-center">
+                Tip: copy any image and press {pasteShortcut} here to use it as the cover.
+              </p>
+            )}
           </div>
 
           <div className="lg:pt-2 min-w-0">
@@ -1755,7 +1860,7 @@ export default function BookReviewPage() {
                   <p className="text-sm text-slate-500 mt-2 leading-6 font-light">
                     {book.cover_url
                       ? "Your photo is kept as a backup and shows whenever the catalogue cover can't load."
-                      : "Photograph your copy so it stands out on your shelf."}
+                      : "Photograph your copy, upload a picture, or paste one you've copied."}
                   </p>
                 </div>
 
@@ -1781,18 +1886,29 @@ export default function BookReviewPage() {
                 </div>
 
                 <div className="flex-1 min-w-0">
+                  {/* Hidden inputs: one for files/gallery, one that opens the camera */}
                   <input
-                    ref={coverInputRef}
+                    ref={coverUploadRef}
                     id="cover-file"
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp"
+                    className="sr-only"
+                    tabIndex={-1}
+                    onChange={(event) => handleCoverFile(event.target.files?.[0])}
+                  />
+                  <input
+                    ref={coverCameraRef}
+                    id="cover-camera"
                     type="file"
                     accept="image/jpeg,image/png,image/webp"
                     capture="environment"
                     className="sr-only"
+                    tabIndex={-1}
                     onChange={(event) => handleCoverFile(event.target.files?.[0])}
                   />
 
-                  <label
-                    htmlFor="cover-file"
+                  {/* Drop / paste zone */}
+                  <div
                     onDragOver={(event) => {
                       event.preventDefault();
                       setDragOver(true);
@@ -1801,21 +1917,68 @@ export default function BookReviewPage() {
                     onDrop={(event) => {
                       event.preventDefault();
                       setDragOver(false);
-                      handleCoverFile(event.dataTransfer.files?.[0]);
+                      const file = Array.from(event.dataTransfer.files ?? []).find((f) => f.type.startsWith("image/"));
+                      if (file) handleCoverFile(file);
+                      else setCoverError("Drop an image file (JPG, PNG or WebP).");
                     }}
-                    className={`flex flex-col items-center justify-center gap-2 text-center min-h-[140px] p-4 rounded-2xl border-2 border-dashed cursor-pointer transition-all ${
-                      dragOver ? "border-[#7a947c] bg-[#7a947c]/10" : "border-[#0f172a]/15 bg-white hover:border-[#7a947c] hover:bg-[#7a947c]/5"
+                    className={`flex flex-col items-center justify-center gap-1.5 text-center min-h-[132px] p-4 rounded-2xl border-2 border-dashed transition-all ${
+                      dragOver ? "border-[#7a947c] bg-[#7a947c]/10" : "border-[#0f172a]/15 bg-white"
                     }`}
                   >
                     <span className="w-10 h-10 rounded-full bg-[#7a947c]/15 text-[#7a947c] flex items-center justify-center" aria-hidden="true">
-                      <CameraIcon size={18} />
+                      <ImageIcon />
                     </span>
-                    <span className="text-sm font-medium">{coverFile ? "Choose a different image" : "Take a photo or choose an image"}</span>
-                    <span className="text-xs text-slate-400">JPG, PNG or WebP, up to 5 MB</span>
-                  </label>
+                    <span className="text-sm font-medium">
+                      {dragOver ? "Drop to use this image" : coverFile ? "Looks good. Want a different one?" : "Drop an image here"}
+                    </span>
+                    {!isTouchDevice && (
+                      <span className="text-xs text-slate-400">
+                        or paste one with <kbd className="px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 font-sans">{pasteShortcut}</kbd>
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Actions */}
+                  <div className="mt-3 grid gap-2">
+                    <button
+                      type="button"
+                      onClick={() => coverUploadRef.current?.click()}
+                      disabled={savingCover}
+                      className={`h-10 rounded-full border border-[#0f172a]/12 bg-white text-sm font-medium text-[#0f172a] hover:border-[#7a947c] hover:text-[#4a5c4b] transition-colors inline-flex items-center justify-center gap-2 disabled:opacity-50 ${focusRing}`}
+                    >
+                      <UploadIcon />
+                      {isTouchDevice ? "Choose from photos" : "Upload a file"}
+                    </button>
+
+                    {isTouchDevice && (
+                      <button
+                        type="button"
+                        onClick={() => coverCameraRef.current?.click()}
+                        disabled={savingCover}
+                        className={`h-10 rounded-full border border-[#0f172a]/12 bg-white text-sm font-medium text-[#0f172a] hover:border-[#7a947c] hover:text-[#4a5c4b] transition-colors inline-flex items-center justify-center gap-2 disabled:opacity-50 ${focusRing}`}
+                      >
+                        <CameraIcon size={16} />
+                        Take a photo
+                      </button>
+                    )}
+
+                    {canReadClipboard && (
+                      <button
+                        type="button"
+                        onClick={pasteFromClipboard}
+                        disabled={savingCover || readingClipboard}
+                        className={`h-10 rounded-full border border-[#0f172a]/12 bg-white text-sm font-medium text-[#0f172a] hover:border-[#7a947c] hover:text-[#4a5c4b] transition-colors inline-flex items-center justify-center gap-2 disabled:opacity-50 ${focusRing}`}
+                      >
+                        {readingClipboard ? <Spinner dark /> : <ClipboardIcon />}
+                        Paste image
+                      </button>
+                    )}
+                  </div>
+
+                  <p className="mt-2.5 text-[11px] text-slate-400 text-center">JPG, PNG or WebP, up to 5 MB</p>
 
                   {coverFile && (
-                    <p className="mt-2 text-xs text-slate-500 truncate">
+                    <p className="mt-1 text-xs text-slate-500 truncate text-center">
                       {coverFile.name} · {(coverFile.size / 1024 / 1024).toFixed(1)} MB
                     </p>
                   )}
@@ -1929,6 +2092,34 @@ function CameraIcon({ size = 14 }: { size?: number }) {
     <svg aria-hidden="true" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <path d="M4 7h3l2-3h6l2 3h3v12H4z" />
       <circle cx="12" cy="13" r="3.5" />
+    </svg>
+  );
+}
+
+function ImageIcon() {
+  return (
+    <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <circle cx="9" cy="10" r="1.8" />
+      <path d="m21 16-5-5-8 9" />
+    </svg>
+  );
+}
+
+function UploadIcon() {
+  return (
+    <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 16V4M7 9l5-5 5 5" />
+      <path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3" />
+    </svg>
+  );
+}
+
+function ClipboardIcon() {
+  return (
+    <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="6" y="4" width="12" height="17" rx="2" />
+      <path d="M9 4V3h6v1" />
     </svg>
   );
 }
