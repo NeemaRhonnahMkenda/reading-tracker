@@ -26,6 +26,7 @@ const NAV_LINKS = [
     { href: "/reading", label: "Reading" },
     { href: "/wishlist", label: "Wishlist" },
     { href: "/family", label: "Family" },
+    { href: "/diary", label: "Diary" },
 ] as const;
 
 // Palette (unchanged)
