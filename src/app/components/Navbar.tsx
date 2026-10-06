@@ -5,6 +5,7 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
 import { supabase } from "../../lib/supabase";
+import { NAV_LINKS, isProtectedPage, loginUrlFor } from "../../lib/routes";
 
 // --------------------------------------------------
 // Config
@@ -21,13 +22,8 @@ const ACTIVITY_EVENTS = [
     "touchstart",
 ] as const;
 
-const NAV_LINKS = [
-    { href: "/library", label: "My Library" },
-    { href: "/reading", label: "Reading" },
-    { href: "/wishlist", label: "Wishlist" },
-    { href: "/family", label: "Family" },
-    { href: "/diary", label: "Diary" },
-] as const;
+// NAV_LINKS now lives in src/lib/routes.ts, so the middleware protects
+// exactly the pages the menu shows.
 
 // Palette (unchanged)
 // navy  #0f172a  | cream #Fdfaf3 | sage #7a947c
@@ -111,6 +107,7 @@ export default function Navbar({ isLoggedIn }: NavbarProps) {
 
     const inactivityTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const lastActivityRef = useRef(0);
+    const signingOutRef = useRef(false);
 
     const isActive = (href: string) =>
         pathname === href || pathname?.startsWith(`${href}/`);
@@ -125,6 +122,7 @@ export default function Navbar({ isLoggedIn }: NavbarProps) {
             inactivityTimerRef.current = null;
         }
 
+        signingOutRef.current = true;
         setLoggingOut(true);
         setLogoutError(null);
 
@@ -134,6 +132,7 @@ export default function Navbar({ isLoggedIn }: NavbarProps) {
             console.error("Logout error:", error.message);
             setLogoutError("Sign out failed. Try again.");
             setLoggingOut(false);
+            signingOutRef.current = false;
             return;
         }
 
@@ -150,6 +149,20 @@ export default function Navbar({ isLoggedIn }: NavbarProps) {
     useEffect(() => {
         logoutRef.current = handleLogout;
     }, [handleLogout]);
+
+    // --------------------------------------------------
+    // Session ended while a protected page is open
+    // (expired, revoked, or signed out in another tab):
+    // go to sign in, then come back to the same page.
+    // The middleware blocks the next request anyway; this
+    // stops the open page from staying on screen.
+    // --------------------------------------------------
+
+    useEffect(() => {
+        if (status !== "signed-out" || signingOutRef.current) return;
+        if (!pathname || !isProtectedPage(pathname)) return;
+        router.replace(loginUrlFor(`${pathname}${window.location.search}`));
+    }, [status, pathname, router]);
 
     // --------------------------------------------------
     // Automatic logout after inactivity (throttled)

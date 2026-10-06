@@ -223,21 +223,22 @@ async function fetchBooksPage(opts: {
   return query;
 }
 
-async function fetchCounts(userId: string): Promise<Counts | null> {
-  const base = () => supabase.from("books").select("id", { count: "exact", head: true }).eq("user_id", userId);
+async function fetchCounts(): Promise<Counts | null> {
+  const { data, error, status } = await supabase.rpc("library_counts");
 
-  const [total, reading, finished] = await Promise.all([
-    base(),
-    base().eq("status", "reading"),
-    base().eq("status", "finished"),
-  ]);
-
-  if (total.error || reading.error || finished.error) {
-    console.error("Count query failed:", total.error?.message || reading.error?.message || finished.error?.message);
+  if (error) {
+    // A full error now, not an empty message
+    console.error("Count query failed:", {
+      status,
+      code: error.code,
+      message: error.message,
+      details: error.details,
+      hint: error.hint,
+    });
     return null;
   }
 
-  return { total: total.count ?? 0, reading: reading.count ?? 0, finished: finished.count ?? 0 };
+  return data as Counts;
 }
 
 // --------------------------------------------------
@@ -490,6 +491,7 @@ export default function Library() {
   // Scroll restoration
   const [pendingReturn, setPendingReturn] = useState<ReturnState | null>(null);
   const [highlightId, setHighlightId] = useState<string | null>(null);
+  const [countsFailed, setCountsFailed] = useState(false);
 
   // --------------------------------------------------
   // Signed URLs: reuse cached ones, sign only what's missing, never block the grid
@@ -586,8 +588,10 @@ export default function Library() {
   );
 
   const refreshCounts = useCallback(async (uid: string) => {
-    const next = await fetchCounts(uid);
-    if (next && userIdRef.current === uid) setCounts(next);
+    const next = await fetchCounts();
+    if (userIdRef.current !== uid) return;
+    if (next) setCounts(next);
+    else setCountsFailed(true);
   }, []);
 
   const hasMore = books.length < totalMatching;
@@ -1115,10 +1119,10 @@ export default function Library() {
         setCounts((current) =>
           current
             ? {
-                total: current.total + 1,
-                reading: current.reading + (newBook.status === "reading" ? 1 : 0),
-                finished: current.finished + (newBook.status === "finished" ? 1 : 0),
-              }
+              total: current.total + 1,
+              reading: current.reading + (newBook.status === "reading" ? 1 : 0),
+              finished: current.finished + (newBook.status === "finished" ? 1 : 0),
+            }
             : current
         );
 
@@ -1181,13 +1185,13 @@ export default function Library() {
 
   const detailRows: [string, string | number | null][] = bookResult
     ? [
-        ["ISBN-13", bookResult.isbn13],
-        ["ISBN-10", bookResult.isbn10],
-        ["Publisher", bookResult.publisher],
-        ["Published", bookResult.publishedDate],
-        ["Binding", bookResult.binding],
-        ["Pages", bookResult.pages],
-      ]
+      ["ISBN-13", bookResult.isbn13],
+      ["ISBN-10", bookResult.isbn10],
+      ["Publisher", bookResult.publisher],
+      ["Published", bookResult.publishedDate],
+      ["Binding", bookResult.binding],
+      ["Pages", bookResult.pages],
+    ]
     : [];
 
   const previewCover = customCoverPreview || bookResult?.coverUrl || null;
@@ -1267,10 +1271,12 @@ export default function Library() {
           ).map(([label, value]) => (
             <div key={label} className="bg-white border border-[#0f172a]/5 rounded-xl p-6 shadow-sm">
               <p className="text-sm text-slate-400 mb-2">{label}</p>
-              {value === undefined ? (
-                <div className="h-9 w-12 rounded-lg bg-[#0f172a]/[0.06] animate-pulse" aria-label="Loading" />
-              ) : (
+              {value !== undefined ? (
                 <p className="text-3xl font-classical text-[#0f172a]">{value}</p>
+              ) : countsFailed ? (
+                <p className="text-3xl font-classical text-slate-300" title="Couldn't load">—</p>
+              ) : (
+                <div className="h-9 w-12 rounded-lg bg-[#0f172a]/[0.06] animate-pulse" aria-label="Loading" />
               )}
             </div>
           ))}
@@ -1297,11 +1303,10 @@ export default function Library() {
                 type="button"
                 onClick={() => setFilter(item.value)}
                 aria-pressed={filter === item.value}
-                className={`px-5 py-2.5 rounded-full text-sm transition-all ${focusRing} ${
-                  filter === item.value
+                className={`px-5 py-2.5 rounded-full text-sm transition-all ${focusRing} ${filter === item.value
                     ? "bg-[#0f172a] text-[#Fdfaf3]"
                     : "bg-white text-slate-600 border border-slate-200 hover:border-[#7a947c] hover:text-[#7a947c]"
-                }`}
+                  }`}
               >
                 {item.label}
               </button>
@@ -1368,9 +1373,8 @@ export default function Library() {
                     style={{ contentVisibility: "auto", containIntrinsicSize: "360px" }}
                   >
                     <div
-                      className={`aspect-[2/3] bg-[#e9e4d9] rounded-lg overflow-hidden shadow-md group-hover:shadow-xl group-hover:-translate-y-1 transition-all duration-300 ${
-                        highlighted ? "ring-2 ring-[#7a947c] ring-offset-4 ring-offset-[#Fdfaf3] animate-return-glow" : ""
-                      }`}
+                      className={`aspect-[2/3] bg-[#e9e4d9] rounded-lg overflow-hidden shadow-md group-hover:shadow-xl group-hover:-translate-y-1 transition-all duration-300 ${highlighted ? "ring-2 ring-[#7a947c] ring-offset-4 ring-offset-[#Fdfaf3] animate-return-glow" : ""
+                        }`}
                     >
                       <BookCover src={coverFor(book)} title={book.title} author={book.author} eager={index < EAGER_COVERS} />
                     </div>
@@ -1476,9 +1480,8 @@ export default function Library() {
                         role="tab"
                         aria-selected={entryMode === mode}
                         onClick={() => switchMode(mode)}
-                        className={`h-10 rounded-full text-sm font-medium transition-all ${focusRing} ${
-                          entryMode === mode ? "bg-white text-[#0f172a] shadow-sm" : "text-slate-500 hover:text-[#0f172a]"
-                        }`}
+                        className={`h-10 rounded-full text-sm font-medium transition-all ${focusRing} ${entryMode === mode ? "bg-white text-[#0f172a] shadow-sm" : "text-slate-500 hover:text-[#0f172a]"
+                          }`}
                       >
                         {mode === "type" ? "Type ISBN" : "Scan barcode"}
                       </button>
@@ -1660,9 +1663,8 @@ export default function Library() {
                           setDragOver(false);
                           handleCoverFile(e.dataTransfer.files?.[0]);
                         }}
-                        className={`flex items-center gap-4 p-5 rounded-2xl border-2 border-dashed cursor-pointer transition-all ${
-                          dragOver ? "border-[#7a947c] bg-[#7a947c]/10" : "border-[#0f172a]/15 bg-white hover:border-[#7a947c] hover:bg-[#7a947c]/5"
-                        }`}
+                        className={`flex items-center gap-4 p-5 rounded-2xl border-2 border-dashed cursor-pointer transition-all ${dragOver ? "border-[#7a947c] bg-[#7a947c]/10" : "border-[#0f172a]/15 bg-white hover:border-[#7a947c] hover:bg-[#7a947c]/5"
+                          }`}
                       >
                         <span className="w-11 h-11 rounded-full bg-[#7a947c]/15 text-[#7a947c] flex items-center justify-center shrink-0" aria-hidden="true">
                           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
@@ -1689,9 +1691,8 @@ export default function Library() {
                         return (
                           <label
                             key={option.value}
-                            className={`relative cursor-pointer rounded-2xl border px-3 py-3 text-center transition-all focus-within:ring-2 focus-within:ring-[#7a947c] ${
-                              checked ? "border-[#0f172a] bg-[#0f172a] text-[#Fdfaf3]" : "border-slate-200 bg-white text-slate-600 hover:border-[#7a947c]"
-                            }`}
+                            className={`relative cursor-pointer rounded-2xl border px-3 py-3 text-center transition-all focus-within:ring-2 focus-within:ring-[#7a947c] ${checked ? "border-[#0f172a] bg-[#0f172a] text-[#Fdfaf3]" : "border-slate-200 bg-white text-slate-600 hover:border-[#7a947c]"
+                              }`}
                           >
                             <input
                               type="radio"
