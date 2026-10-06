@@ -1,5 +1,10 @@
 // src/lib/reading.ts
 // Types, formatting helpers and queries shared by the Diary page and its components.
+//
+// Covers: every query below returns `cover_url` as the cover to DISPLAY.
+// If the book has your own photo (custom_cover_path in the private bucket),
+// cover_url is replaced with a signed link to it; otherwise it stays the
+// catalogue cover. custom_cover_path keeps the raw storage path.
 
 import { supabase } from "./supabase";
 
@@ -13,6 +18,7 @@ export interface BookOption {
   author: string | null;
   status: string | null;
   cover_url: string | null;
+  custom_cover_path: string | null;
 }
 
 export interface ReadingSession {
@@ -28,7 +34,7 @@ export interface ReadingSession {
   thoughts: string | null;
   created_at: string;
   updated_at: string;
-  book: { id: string; title: string; author: string | null; cover_url: string | null } | null;
+  book: { id: string; title: string; author: string | null; cover_url: string | null; custom_cover_path: string | null } | null;
 }
 
 // A day where you wrote journal notes for a book but didn't log a session for it
@@ -44,6 +50,7 @@ export interface JournalDay {
   book_title: string;
   book_author: string | null;
   cover_url: string | null;
+  custom_cover_path: string | null;
 }
 
 export type ActivityItem =
@@ -87,7 +94,7 @@ export type SessionDraft = Omit<SessionInput, "minutes_read" | "thoughts"> & { t
 // --------------------------------------------------
 
 export const SESSION_COLUMNS =
-  "id, user_id, book_id, session_date, start_chapter, start_page, end_chapter, end_page, minutes_read, thoughts, created_at, updated_at, book:books(id, title, author, cover_url)";
+  "id, user_id, book_id, session_date, start_chapter, start_page, end_chapter, end_page, minutes_read, thoughts, created_at, updated_at, book:books(id, title, author, cover_url, custom_cover_path)";
 
 export const ACTIVITY_WINDOW_DAYS = 30;
 export const STATS_DAYS = 98; // 14 weeks: enough for the heatmap plus padding
@@ -105,6 +112,66 @@ export const STATUS_LABEL: Record<string, string> = {
   did_not_finish: "Did not finish",
   finished: "Finished",
 };
+
+// Private bucket for your own cover photos (keep in sync with the library page)
+const COVER_BUCKET = process.env.NEXT_PUBLIC_SUPABASE_COVER_BUCKET || "book-covers";
+const SIGNED_URL_TTL = 60 * 60; // 1 hour
+const SIGNED_URL_MIN_REMAINING = 5 * 60 * 1000; // re-sign when under 5 minutes left
+
+// --------------------------------------------------
+// Covers: your photo first, catalogue cover as fallback
+// --------------------------------------------------
+
+// Reuse signed links between calls so the browser can cache the images
+const signedCoverCache = new Map<string, { url: string; expiresAt: number }>();
+
+// Signs any paths that aren't already cached, in one request.
+// Returns path -> signed URL for every path it could sign.
+async function signCoverPaths(paths: (string | null | undefined)[]) {
+  const now = Date.now();
+  const unique = Array.from(new Set(paths.filter((p): p is string => !!p)));
+  const result = new Map<string, string>();
+  const missing: string[] = [];
+
+  for (const path of unique) {
+    const cached = signedCoverCache.get(path);
+    if (cached && cached.expiresAt - now > SIGNED_URL_MIN_REMAINING) result.set(path, cached.url);
+    else missing.push(path);
+  }
+
+  if (missing.length === 0) return result;
+
+  const { data, error } = await supabase.storage.from(COVER_BUCKET).createSignedUrls(missing, SIGNED_URL_TTL);
+
+  if (error || !data) {
+    // Not fatal: those books fall back to their catalogue cover
+    console.error("Error signing cover photos:", error?.message);
+    return result;
+  }
+
+  const expiresAt = Date.now() + SIGNED_URL_TTL * 1000;
+  for (const item of data) {
+    if (item.path && item.signedUrl) {
+      signedCoverCache.set(item.path, { url: item.signedUrl, expiresAt });
+      result.set(item.path, item.signedUrl);
+    }
+  }
+
+  return result;
+}
+
+// The cover to show: your photo if it's available, otherwise the catalogue cover
+function displayCover(customPath: string | null | undefined, coverUrl: string | null, signed: Map<string, string>) {
+  return (customPath && signed.get(customPath)) || coverUrl || null;
+}
+
+// Exported so a freshly saved session (from the log form) can get its cover too
+export async function resolveSessionCovers(sessions: ReadingSession[]): Promise<ReadingSession[]> {
+  const signed = await signCoverPaths(sessions.map((s) => s.book?.custom_cover_path));
+  return sessions.map((s) =>
+    s.book ? { ...s, book: { ...s.book, cover_url: displayCover(s.book.custom_cover_path, s.book.cover_url, signed) } } : s
+  );
+}
 
 // --------------------------------------------------
 // Dates
@@ -258,13 +325,37 @@ export async function fetchSessionsInRange(userId: string, from: string, to: str
     .order("created_at", { ascending: false });
 
   if (error) throw error;
-  return (data ?? []) as unknown as ReadingSession[];
+  return resolveSessionCovers((data ?? []) as unknown as ReadingSession[]);
 }
 
 export async function fetchJournalDays(from: string, to: string) {
   const { data, error } = await supabase.rpc("journal_reading_days", { p_from: from, p_to: to });
   if (error) throw error;
-  return (data ?? []) as JournalDay[];
+
+  const days = (data ?? []) as JournalDay[];
+  if (days.length === 0) return days;
+
+  // The journal function doesn't return your cover photo path, so look it up
+  const bookIds = Array.from(new Set(days.map((d) => d.book_id)));
+  const { data: books, error: booksError } = await supabase
+    .from("books")
+    .select("id, custom_cover_path")
+    .in("id", bookIds);
+
+  if (booksError) {
+    console.error("Error loading cover photos for journal days:", booksError.message);
+    return days.map((d) => ({ ...d, custom_cover_path: null }));
+  }
+
+  const pathByBook = new Map(
+    ((books ?? []) as { id: string; custom_cover_path: string | null }[]).map((b) => [b.id, b.custom_cover_path])
+  );
+  const signed = await signCoverPaths(Array.from(pathByBook.values()));
+
+  return days.map((d) => {
+    const customPath = pathByBook.get(d.book_id) ?? null;
+    return { ...d, custom_cover_path: customPath, cover_url: displayCover(customPath, d.cover_url, signed) };
+  });
 }
 
 // Earliest day with any reading activity, to know when to stop paging back
@@ -300,12 +391,15 @@ export async function fetchOldestActivityDate(userId: string) {
 export async function fetchBookOptions(userId: string) {
   const { data, error } = await supabase
     .from("books")
-    .select("id, title, author, status, cover_url")
+    .select("id, title, author, status, cover_url, custom_cover_path")
     .eq("user_id", userId)
     .order("title");
 
   if (error) throw error;
-  return (data ?? []) as BookOption[];
+
+  const books = (data ?? []) as BookOption[];
+  const signed = await signCoverPaths(books.map((b) => b.custom_cover_path));
+  return books.map((b) => ({ ...b, cover_url: displayCover(b.custom_cover_path, b.cover_url, signed) }));
 }
 
 // Where you stopped last time in this book: latest session or journal note
