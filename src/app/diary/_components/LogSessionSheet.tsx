@@ -2,6 +2,7 @@
 
 // src/app/diary/_components/LogSessionSheet.tsx
 // Log a new reading session, or edit an existing one.
+// Responsive: bottom sheet on phones, centred dialog from tablet up.
 
 import Link from "next/link";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
@@ -26,10 +27,14 @@ import BookThumb from "./BookThumb";
 const QUICK_MINUTES = [15, 30, 45, 60, 90];
 const MAX_THOUGHTS = 2000;
 
+// 16px text on phones stops iOS Safari zooming in when a field is focused;
+// min-w-0 lets fields (especially the date picker) shrink inside grids
 const fieldClass =
-  "w-full h-11 px-3.5 bg-white border border-[#0f172a]/10 rounded-xl text-sm text-slate-700 placeholder:text-slate-300 focus:outline-none focus:border-[#7a947c] focus:ring-4 focus:ring-[#7a947c]/10 transition-all";
+  "w-full min-w-0 h-12 sm:h-11 px-3.5 bg-white border border-[#0f172a]/10 rounded-xl text-base sm:text-sm text-slate-700 placeholder:text-slate-300 focus:outline-none focus:border-[#7a947c] focus:ring-4 focus:ring-[#7a947c]/10 transition-all";
 
 const labelClass = "block text-xs font-medium text-slate-500 mb-1.5";
+
+const legendClass = "font-classical text-lg sm:text-xl font-semibold text-[#0f172a]";
 
 // 90 -> { hours: "1", minutes: "30" }; 45 -> { hours: "", minutes: "45" }
 function splitDuration(total: number) {
@@ -91,6 +96,7 @@ export default function LogSessionSheet({
 
   // Don't overwrite a start position that's prefilled or typed by the reader
   const startTouchedRef = useRef(false);
+  const errorRef = useRef<HTMLParagraphElement | null>(null);
 
   // ---------- Reset when opened ----------
 
@@ -171,6 +177,11 @@ export default function LogSessionSheet({
       cancelled = true;
     };
   }, [open, isEdit, bookId]);
+
+  // On a small screen the error sits in the footer; make sure it's seen
+  useEffect(() => {
+    if (error) errorRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [error]);
 
   // ---------- Derived ----------
 
@@ -287,8 +298,13 @@ export default function LogSessionSheet({
 
   return (
     <Modal open={open} onClose={onClose} labelledBy="log-title" size="lg" dismissible={!saving}>
-      <form onSubmit={handleSubmit} noValidate className="flex flex-col flex-1 min-h-0">
-        <div className="px-6 sm:px-8 pt-6 sm:pt-8 pb-5 border-b border-[#0f172a]/[0.06]">
+      {/* On phones the sheet is capped to the visible screen (dvh accounts for the
+          browser bars); the body scrolls and the footer stays in reach */}
+      <form onSubmit={handleSubmit} noValidate className="flex flex-col flex-1 min-h-0 max-h-[92dvh] sm:max-h-[90vh]">
+        {/* Header */}
+        <div className="shrink-0 px-5 sm:px-8 pt-3 sm:pt-8 pb-4 sm:pb-5 border-b border-[#0f172a]/[0.06]">
+          {/* Grab handle on the phone bottom sheet */}
+          <div aria-hidden="true" className="sm:hidden mx-auto mb-3 h-1 w-10 rounded-full bg-[#0f172a]/15" />
           <ModalHeader
             id="log-title"
             title={isEdit ? "Edit session" : "Log reading"}
@@ -298,17 +314,18 @@ export default function LogSessionSheet({
           />
         </div>
 
-        <div className="flex-1 overflow-y-auto px-6 sm:px-8 py-7 space-y-9">
+        {/* Body */}
+        <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain px-5 sm:px-8 py-6 sm:py-7 space-y-8 sm:space-y-9">
           {/* Book */}
-          <fieldset>
-            <legend className="font-classical text-xl font-semibold text-[#0f172a] mb-3">What did you read?</legend>
+          <fieldset className="min-w-0">
+            <legend className={`${legendClass} mb-3`}>What did you read?</legend>
 
             {books.length === 0 ? (
-              <div className="rounded-2xl border border-dashed border-[#0f172a]/15 bg-white/60 p-6 text-center">
+              <div className="rounded-2xl border border-dashed border-[#0f172a]/15 bg-white/60 p-5 sm:p-6 text-center">
                 <p className="text-sm text-slate-600 font-light">Add a book to your library first, then log your reading here.</p>
                 <Link
                   href="/library"
-                  className={`mt-3 inline-block text-sm font-medium text-[#4a5c4b] underline underline-offset-4 decoration-[#7a947c]/40 rounded ${focusRing}`}
+                  className={`mt-3 inline-flex items-center min-h-11 text-sm font-medium text-[#4a5c4b] underline underline-offset-4 decoration-[#7a947c]/40 rounded ${focusRing}`}
                 >
                   Go to My Library
                 </Link>
@@ -321,15 +338,21 @@ export default function LogSessionSheet({
                     <input
                       id="book-search"
                       type="search"
+                      enterKeyHint="search"
                       value={bookQuery}
                       onChange={(e) => setBookQuery(e.target.value)}
                       placeholder="Search by title or author"
-                      className="w-full h-11 px-5 bg-white border border-slate-200 rounded-full text-sm text-slate-700 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-[#7a947c]/30 focus:border-[#7a947c] transition-all"
+                      className="w-full h-12 sm:h-11 px-5 bg-white border border-slate-200 rounded-full text-base sm:text-sm text-slate-700 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-[#7a947c]/30 focus:border-[#7a947c] transition-all"
                     />
                   </div>
                 )}
 
-                <div role="radiogroup" aria-label="Book" className="max-h-64 overflow-y-auto -mx-1 px-1 py-1 space-y-2">
+                {/* Shorter list on short screens (landscape phones) so the rest of the form stays reachable */}
+                <div
+                  role="radiogroup"
+                  aria-label="Book"
+                  className="max-h-[min(16rem,38dvh)] overflow-y-auto overscroll-contain -mx-1 px-1 py-1 space-y-2"
+                >
                   {visibleBooks.length === 0 && <p className="text-sm text-slate-500 font-light px-1">No books match that search.</p>}
 
                   {visibleBooks.map((book) => {
@@ -342,13 +365,13 @@ export default function LogSessionSheet({
                         aria-checked={checked}
                         onClick={() => changeBook(book.id)}
                         disabled={isEdit && !checked}
-                        className={`w-full flex items-center gap-3 p-2.5 pr-4 rounded-2xl border text-left transition-all disabled:opacity-35 ${focusRing} ${
+                        className={`w-full min-w-0 flex items-center gap-3 p-2.5 pr-3 sm:pr-4 rounded-2xl border text-left transition-all disabled:opacity-35 ${focusRing} ${
                           checked ? "border-[#7a947c] bg-[#eef3ee]" : "border-[#0f172a]/10 bg-white hover:border-[#7a947c]/50"
                         }`}
                       >
                         <BookThumb title={book.title} coverUrl={book.cover_url} className="w-9 h-[54px]" />
                         <span className="flex-1 min-w-0">
-                          <span className="block font-classical font-semibold text-[#0f172a] truncate">{book.title}</span>
+                          <span className="block font-classical font-semibold text-[15px] sm:text-base text-[#0f172a] truncate">{book.title}</span>
                           <span className="block text-xs text-slate-400 truncate">
                             {book.author ? `${book.author}, ` : ""}
                             {STATUS_LABEL[book.status ?? "want_to_read"]}
@@ -371,13 +394,14 @@ export default function LogSessionSheet({
           </fieldset>
 
           {/* Position */}
-          <fieldset>
-            <legend className="font-classical text-xl font-semibold text-[#0f172a]">Where did you start and stop?</legend>
+          <fieldset className="min-w-0">
+            <legend className={legendClass}>Where did you start and stop?</legend>
             <p className="text-sm text-slate-500 font-light mt-1 mb-4" aria-live="polite">
               {prefillNote || "A chapter can be a number or a name, like Prologue."}
             </p>
 
-            <div className="grid sm:grid-cols-2 gap-4">
+            {/* Stacked on phones, side by side from tablet up */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4">
               {(
                 [
                   {
@@ -402,27 +426,32 @@ export default function LogSessionSheet({
                   },
                 ] as const
               ).map((group) => (
-                <div key={group.title} className="soft-surface rounded-2xl border soft-border p-4">
+                <div key={group.title} className="min-w-0 soft-surface rounded-2xl border soft-border p-4">
                   <p className="text-sm font-medium text-slate-700 mb-3">{group.title}</p>
-                  <div className="grid grid-cols-[1fr_92px] gap-3">
-                    <div>
+                  <div className="grid grid-cols-[minmax(0,1fr)_minmax(5.5rem,7rem)] gap-3">
+                    <div className="min-w-0">
                       <label htmlFor={group.chapterId} className={labelClass}>Chapter</label>
                       <input
                         id={group.chapterId}
                         type="text"
                         maxLength={100}
+                        enterKeyHint="next"
+                        autoComplete="off"
                         value={group.chapter}
                         onChange={(e) => group.onChapter(e.target.value)}
                         placeholder={group.placeholders[0]}
                         className={fieldClass}
                       />
                     </div>
-                    <div>
+                    <div className="min-w-0">
                       <label htmlFor={group.pageId} className={labelClass}>Page</label>
                       <input
                         id={group.pageId}
                         type="text"
                         inputMode="numeric"
+                        pattern="[0-9]*"
+                        enterKeyHint="next"
+                        autoComplete="off"
                         value={group.page}
                         onChange={(e) => group.onPage(e.target.value.replace(/[^\d]/g, ""))}
                         placeholder={group.placeholders[1]}
@@ -442,10 +471,15 @@ export default function LogSessionSheet({
           </fieldset>
 
           {/* Time */}
-          <fieldset>
-            <legend className="font-classical text-xl font-semibold text-[#0f172a] mb-3">How long did you read?</legend>
+          <fieldset className="min-w-0">
+            <legend className={`${legendClass} mb-3`}>How long did you read?</legend>
 
-            <div role="group" aria-label="Quick times" className="inline-flex flex-wrap gap-1 p-1 rounded-2xl sm:rounded-full bg-[#0f172a]/5 mb-4">
+            {/* Even grid of tap targets on phones, one pill row on larger screens */}
+            <div
+              role="group"
+              aria-label="Quick times"
+              className="grid grid-cols-3 sm:inline-flex sm:flex-wrap gap-1 p-1 rounded-2xl sm:rounded-full bg-[#0f172a]/5 mb-4 w-full sm:w-auto"
+            >
               {QUICK_MINUTES.map((value) => {
                 const active = totalMinutes === value;
                 return (
@@ -454,7 +488,7 @@ export default function LogSessionSheet({
                     type="button"
                     onClick={() => setQuickDuration(value)}
                     aria-pressed={active}
-                    className={`h-8 px-3.5 rounded-full text-xs font-medium transition-all ${focusRing} ${
+                    className={`h-10 sm:h-8 px-3.5 rounded-xl sm:rounded-full text-sm sm:text-xs font-medium whitespace-nowrap transition-all ${focusRing} ${
                       active ? "bg-white text-[#0f172a] shadow-sm" : "text-slate-500 hover:text-[#0f172a]"
                     }`}
                   >
@@ -464,13 +498,17 @@ export default function LogSessionSheet({
               })}
             </div>
 
-            <div className="grid grid-cols-[1fr_1fr_1.4fr] gap-3">
-              <div>
+            {/* Hours + minutes share a row; the date gets its own row on phones */}
+            <div className="grid grid-cols-2 sm:grid-cols-[1fr_1fr_1.4fr] gap-3">
+              <div className="min-w-0">
                 <label htmlFor="hours" className={labelClass}>Hours</label>
                 <input
                   id="hours"
                   type="text"
                   inputMode="numeric"
+                  pattern="[0-9]*"
+                  enterKeyHint="next"
+                  autoComplete="off"
                   maxLength={2}
                   value={hours}
                   onChange={(e) => setHours(e.target.value.replace(/[^\d]/g, ""))}
@@ -478,12 +516,15 @@ export default function LogSessionSheet({
                   className={fieldClass}
                 />
               </div>
-              <div>
+              <div className="min-w-0">
                 <label htmlFor="minutes" className={labelClass}>Minutes</label>
                 <input
                   id="minutes"
                   type="text"
                   inputMode="numeric"
+                  pattern="[0-9]*"
+                  enterKeyHint="next"
+                  autoComplete="off"
                   maxLength={3}
                   value={minutes}
                   onChange={(e) => setMinutes(e.target.value.replace(/[^\d]/g, ""))}
@@ -491,7 +532,7 @@ export default function LogSessionSheet({
                   className={fieldClass}
                 />
               </div>
-              <div>
+              <div className="min-w-0 col-span-2 sm:col-span-1">
                 <label htmlFor="session-date" className={labelClass}>Day</label>
                 <input
                   id="session-date"
@@ -499,17 +540,17 @@ export default function LogSessionSheet({
                   value={date}
                   max={today}
                   onChange={(e) => setDate(e.target.value)}
-                  className={fieldClass}
+                  className={`${fieldClass} appearance-none [&::-webkit-date-and-time-value]:text-left`}
                 />
               </div>
             </div>
           </fieldset>
 
           {/* Thoughts */}
-          <div>
-            <div className="flex items-baseline justify-between mb-3">
-              <label htmlFor="thoughts" className="font-classical text-xl font-semibold text-[#0f172a]">Thoughts so far</label>
-              <span className="text-xs text-slate-400">Optional</span>
+          <div className="min-w-0">
+            <div className="flex items-baseline justify-between gap-3 mb-3">
+              <label htmlFor="thoughts" className={legendClass}>Thoughts so far</label>
+              <span className="text-xs text-slate-400 shrink-0">Optional</span>
             </div>
             <textarea
               id="thoughts"
@@ -518,7 +559,7 @@ export default function LogSessionSheet({
               value={thoughts}
               onChange={(e) => setThoughts(e.target.value)}
               placeholder="How's it going? A character you love, a twist you saw coming, a line worth keeping…"
-              className="journal-paper w-full px-4 border border-[#0f172a]/10 rounded-xl resize-y min-h-[160px] text-sm text-slate-700 placeholder:text-slate-300 focus:outline-none focus:border-[#7a947c] focus:ring-4 focus:ring-[#7a947c]/10 transition-all"
+              className="journal-paper w-full px-4 border border-[#0f172a]/10 rounded-xl resize-y min-h-[140px] sm:min-h-[160px] text-base sm:text-sm text-slate-700 placeholder:text-slate-300 focus:outline-none focus:border-[#7a947c] focus:ring-4 focus:ring-[#7a947c]/10 transition-all"
             />
             {thoughts.length > MAX_THOUGHTS * 0.8 && (
               <p className="mt-1 text-right text-[11px] text-slate-400">{MAX_THOUGHTS - thoughts.length} characters left</p>
@@ -529,19 +570,19 @@ export default function LogSessionSheet({
           {selectedBook && selectedBook.status !== "finished" && (
             <div className="space-y-3">
               <label
-                className={`flex items-center gap-3 p-4 rounded-2xl border cursor-pointer transition-all has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-[#7a947c] ${
+                className={`flex items-center gap-3 p-4 min-h-14 rounded-2xl border cursor-pointer transition-all has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-[#7a947c] ${
                   finished ? "border-[#7a947c] bg-[#eef3ee]" : "border-[#0f172a]/10 bg-white"
                 }`}
               >
-                <input type="checkbox" checked={finished} onChange={(e) => setFinished(e.target.checked)} className="w-4 h-4 accent-[#7a947c]" />
-                <span>
+                <input type="checkbox" checked={finished} onChange={(e) => setFinished(e.target.checked)} className="w-5 h-5 sm:w-4 sm:h-4 shrink-0 accent-[#7a947c]" />
+                <span className="min-w-0">
                   <span className="block text-sm font-medium text-[#0f172a]">I finished this book</span>
                   <span className="block text-xs text-slate-400">It moves to your Finished shelf.</span>
                 </span>
               </label>
 
               {willStartReading && (
-                <p className="text-xs text-slate-500 font-light">
+                <p className="text-xs text-slate-500 font-light break-words">
                   Logging this moves <span className="font-medium text-slate-700">{selectedBook.title}</span> to Currently reading.
                 </p>
               )}
@@ -549,18 +590,21 @@ export default function LogSessionSheet({
           )}
         </div>
 
-        <div className="px-6 sm:px-8 py-5 border-t border-[#0f172a]/[0.06] bg-[#fdfaf3] sm:rounded-b-[1.6rem] flex flex-col-reverse sm:flex-row sm:items-center gap-3">
-          {error ? (
-            <p role="alert" className="flex-1 text-sm text-[#a14e43]">{error}</p>
-          ) : (
-            <span className="flex-1" />
+        {/* Footer: always visible; clears the home indicator on iPhones */}
+        <div className="shrink-0 px-5 sm:px-8 pt-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:py-5 border-t border-[#0f172a]/[0.06] bg-[#fdfaf3] sm:rounded-b-[1.6rem]">
+          {error && (
+            <p ref={errorRef} role="alert" className="mb-3 text-sm text-[#a14e43]">
+              {error}
+            </p>
           )}
-          <Button variant="outline" onClick={onClose} disabled={saving}>
-            Cancel
-          </Button>
-          <Button type="submit" variant="primary" loading={saving} disabled={books.length === 0}>
-            {saving ? "Saving…" : isEdit ? "Save changes" : totalMinutes > 0 ? `Log ${formatMinutes(totalMinutes)}` : "Log session"}
-          </Button>
+          <div className="flex flex-col-reverse sm:flex-row sm:justify-end gap-2.5 sm:gap-3">
+            <Button variant="outline" onClick={onClose} disabled={saving} className="w-full sm:w-auto">
+              Cancel
+            </Button>
+            <Button type="submit" variant="primary" size="lg" loading={saving} disabled={books.length === 0} className="w-full sm:w-auto">
+              {saving ? "Saving…" : isEdit ? "Save changes" : totalMinutes > 0 ? `Log ${formatMinutes(totalMinutes)}` : "Log session"}
+            </Button>
+          </div>
         </div>
       </form>
     </Modal>
