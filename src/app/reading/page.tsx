@@ -284,7 +284,7 @@ export default function ReadingPage() {
         <div className="mt-8 sm:mt-10">
           {loading ? (
             <div aria-busy="true" aria-label="Loading your shelves">
-              <ReadingSkeleton />
+              <ReadingSkeleton view={view} />
             </div>
           ) : loadError ? (
             <div className="rounded-[1.6rem] bg-[#fbefed] border border-red-200/70 px-6 py-10 text-center">
@@ -486,11 +486,11 @@ export default function ReadingPage() {
                   </h2>
                 </div>
 
-                <div className="grid gap-4 sm:gap-5 lg:grid-cols-5">
-                  <div className="lg:col-span-3">
+                <div className="grid grid-cols-1 gap-4 sm:gap-5 lg:grid-cols-5">
+                  <div className="min-w-0 lg:col-span-3">
                     <FinishedByYear data={stats.byYear} selected={yearFilter} onSelect={pickYear} currentYear={currentYear} />
                   </div>
-                  <div className="lg:col-span-2">
+                  <div className="min-w-0 lg:col-span-2">
                     <ReviewProgress
                       finished={stats.counts.finished}
                       reviewed={stats.reviewed}
@@ -498,10 +498,10 @@ export default function ReadingPage() {
                       unreviewed={stats.unreviewed}
                     />
                   </div>
-                  <div className="lg:col-span-3">
+                  <div className="min-w-0 lg:col-span-3">
                     <RatingBreakdown dist={stats.ratingDist} avg={stats.avgRating} />
                   </div>
-                  <div className="lg:col-span-2">
+                  <div className="min-w-0 lg:col-span-2">
                     <TopAuthors authors={stats.topAuthors} />
                   </div>
                 </div>
