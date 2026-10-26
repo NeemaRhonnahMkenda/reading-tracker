@@ -14,6 +14,7 @@ import {
   useRef,
   useState,
 } from "react";
+import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import Navbar from "../../components/Navbar";
 import { supabase } from "../../../lib/supabase";
@@ -1608,6 +1609,17 @@ export default function BookReviewPage() {
                 {review ? "Your review" : "Write review"}
               </button>
             </div>
+
+            <Link
+              href={`/shelves?find=${book.id}`}
+              className={`mt-4 inline-flex items-center gap-2 text-sm font-medium text-[#8a6a22] hover:text-[#0f172a] underline underline-offset-4 decoration-[#c69a3d]/40 rounded ${focusRing}`}
+            >
+              <svg width="14" height="18" viewBox="0 0 38 50" aria-hidden="true">
+                <path d="M19 49C19 49 3 30 3 18.5 3 9.4 10.2 2 19 2s16 7.4 16 16.5C35 30 19 49 19 49z" fill="#c69a3d" />
+                <circle cx="19" cy="18" r="6.5" fill="#fdfaf3" />
+              </svg>
+              Find it on my shelves
+            </Link>
           </div>
         </div>
 

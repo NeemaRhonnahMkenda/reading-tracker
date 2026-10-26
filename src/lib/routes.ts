@@ -5,7 +5,8 @@
 
 export const NAV_LINKS = [
   { href: "/library", label: "My Library" },
-  { href: "/reading", label: "Reading Stats" },
+  { href: "/reading", label: "Reading" },
+  { href: "/shelves", label: "Shelves" },
   { href: "/wishlist", label: "Wishlist" },
   { href: "/family", label: "Family" },
   { href: "/diary", label: "Diary" },
