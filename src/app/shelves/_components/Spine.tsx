@@ -8,7 +8,7 @@
 import { CSSProperties, memo } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { focusRing } from "../../components/ui/Button";
-import { heightRatio, paintedColor, readableText, spineRatio, type Placement, type ShelfBook } from "../_lib/shelves";
+import { heightRatio, paintedColor, readableText, showsPhoto, spineRatio, type Placement, type ShelfBook } from "../_lib/shelves";
 
 export interface SpineLook {
   book: ShelfBook;
@@ -19,7 +19,7 @@ export interface SpineLook {
 }
 
 export function spineSize({ book, placement, shelfHeight }: Pick<SpineLook, "book" | "placement" | "shelfHeight">) {
-  const height = Math.round(shelfHeight * heightRatio(book.id));
+  const height = Math.round(shelfHeight * heightRatio(book.id, placement));
   const width = Math.round(Math.min(92, Math.max(13, height * spineRatio(placement, book))));
   return { width, height };
 }
@@ -44,8 +44,11 @@ export const SpineVisual = memo(function SpineVisual({
   const { book, placement, photo, usePhoto } = look;
   const { width, height } = spineSize(look);
   const color = placement?.spine_color || paintedColor(book);
-  const ink = readableText(color);
-  const showPhoto = usePhoto && !!photo;
+  const ink = readableText(color, placement?.spine_text ?? "auto");
+  const showPhoto = showsPhoto(placement, photo, usePhoto);
+  const fontClass = placement?.spine_font === "sans" ? "font-sans tracking-wide uppercase" : "font-classical";
+  const photoFilter = `brightness(${placement?.photo_brightness ?? 1})`;
+  const flip = placement?.photo_flip ? " rotate(180deg)" : "";
 
   const flat = orientation === "flat";
   // Lying flat: the book's height becomes its length, the spine width its thickness
@@ -77,7 +80,11 @@ export const SpineVisual = memo(function SpineVisual({
           draggable={false}
           className={`absolute object-cover ${flat ? "max-w-none" : "inset-0 w-full h-full"}`}
           // Lying flat: the upright photo is turned a quarter turn to lie along the book
-          style={flat ? { width: boxH, height: boxW, left: (boxW - boxH) / 2, top: (boxH - boxW) / 2, transform: "rotate(-90deg)" } : undefined}
+          style={
+            flat
+              ? { width: boxH, height: boxW, left: (boxW - boxH) / 2, top: (boxH - boxW) / 2, transform: `rotate(-90deg)${flip}`, filter: photoFilter }
+              : { transform: flip || undefined, filter: photoFilter }
+          }
         />
       ) : (
         <>
@@ -91,7 +98,7 @@ export const SpineVisual = memo(function SpineVisual({
 
           {flat ? (
             <span className="absolute inset-0 flex items-center gap-2 px-2 whitespace-nowrap" style={{ fontSize: titleSize }}>
-              <span className="font-classical font-semibold truncate">{book.title}</span>
+              <span className={`${fontClass} font-semibold truncate`}>{book.title}</span>
               {boxH >= 16 && book.author && <span className="opacity-60 text-[0.85em] truncate">{surname(book.author)}</span>}
             </span>
           ) : (
@@ -99,7 +106,7 @@ export const SpineVisual = memo(function SpineVisual({
               className="absolute inset-0 flex items-center justify-between py-[12%] [writing-mode:vertical-rl]"
               style={{ fontSize: titleSize }}
             >
-              <span className="font-classical font-semibold leading-none truncate max-h-[74%]">{book.title}</span>
+              <span className={`${fontClass} font-semibold leading-none truncate max-h-[74%]`}>{book.title}</span>
               {width >= 20 && book.author && <span className="leading-none opacity-65 text-[0.8em] truncate max-h-[22%]">{surname(book.author)}</span>}
             </span>
           )}

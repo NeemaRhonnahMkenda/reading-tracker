@@ -22,7 +22,15 @@ type Box = { left: number; top: number; width: number; height: number };
 
 const CARD_W = 300;
 
-export default function FindSpotlight({ target, onClose }: { target: FindTarget | null; onClose: () => void }) {
+export default function FindSpotlight({
+  target,
+  onClose,
+  onEdit,
+}: {
+  target: FindTarget | null;
+  onClose: () => void;
+  onEdit: (bookId: string) => void;
+}) {
   const [box, setBox] = useState<Box | null>(null);
   const [shown, setShown] = useState(false);
   const [view, setView] = useState({ w: 1024, h: 768 });
@@ -194,6 +202,14 @@ export default function FindSpotlight({ target, onClose }: { target: FindTarget 
                 <span className="block text-[#8a6a22]">{target.detail}</span>
               </p>
             </div>
+
+            <button
+              type="button"
+              onClick={() => onEdit(book.id)}
+              className={`mt-3 text-xs font-medium text-[#8a6a22] underline underline-offset-4 decoration-[#c69a3d]/40 hover:text-[#0f172a] rounded ${focusRing}`}
+            >
+              Edit spine look
+            </button>
 
             <div className="mt-3 grid grid-cols-2 gap-2">
               <Link

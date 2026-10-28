@@ -34,6 +34,7 @@ import {
   buildLayout,
   createBookcase,
   deleteBookcase,
+  emptyPlacement,
   errorMessage,
   loadShelvesData,
   ordinal,
@@ -55,7 +56,16 @@ import FindSpotlight, { type FindTarget } from "./_components/FindSpotlight";
 import MoveBookSheet, { type MoveRequest } from "./_components/MoveBookSheet";
 import BookcaseSheet, { type BookcaseSheetMode } from "./_components/BookcaseSheet";
 import ScanShelfSheet from "./_components/ScanShelfSheet";
+import SpineEditorSheet from "./_components/SpineEditorSheet";
 import { SpineVisual } from "./_components/Spine";
+import {
+  ROW_NAMES,
+  buildRows,
+  describeSpot,
+  moveBook,
+  removeBook,
+  type Target,
+} from "./_lib/arrange";
 
 const PHOTO_KEY = "archive:shelves-photo-spines";
 
@@ -88,23 +98,213 @@ function containerOf(layout: Layout, bookId: string) {
   return Object.keys(layout).find((k) => layout[k].includes(bookId)) ?? null;
 }
 
-// Where in this list a point falls, reading left to right, top to bottom
-function indexFromPoint(ids: string[], x: number, y: number) {
-  for (let i = 0; i < ids.length; i++) {
-    const el = document.querySelector(`[data-spine-id="${CSS.escape(ids[i])}"]`);
-    if (!el) continue;
-    const r = el.getBoundingClientRect();
-    if (y < r.top - 4) return i;
-    if (y <= r.bottom + 4 && x < r.left + r.width / 2) return i;
-  }
-  return ids.length;
-}
-
-// Collisions only against containers (shelves and the tray)
+// Collisions only against containers; row tabs win over the shelf behind them
 const collision: CollisionDetection = (args) => {
   const hits = pointerWithin(args);
-  return hits.length ? hits : rectIntersection(args);
+  if (hits.length) {
+    const tab = hits.find((h) => args.droppableContainers.find((c) => c.id === h.id)?.data.current?.tab);
+    return tab ? [tab] : hits;
+  }
+  return rectIntersection(args);
 };
+
+// ------------------------------------------------------------
+// Working out where a dragged book will land
+// ------------------------------------------------------------
+
+type Box = { left: number; top: number; width: number; height: number };
+
+interface DropHint {
+  key: string;
+  shelfId: string | null; // null = off the shelf
+  target: Target;
+  line?: Box; // gold insertion bar
+  box?: Box; // outline of what it joins
+  label: string;
+}
+
+const CAP = 46; // px above a group that counts as "on top of it"
+
+function rectOfSpine(id: string) {
+  return document.querySelector(`[data-spine-id="${CSS.escape(id)}"]`)?.getBoundingClientRect() ?? null;
+}
+
+function union(rects: (DOMRect | null)[]): Box | null {
+  const rs = rects.filter((r): r is DOMRect => !!r);
+  if (!rs.length) return null;
+  const left = Math.min(...rs.map((r) => r.left));
+  const top = Math.min(...rs.map((r) => r.top));
+  return { left, top, width: Math.max(...rs.map((r) => r.right)) - left, height: Math.max(...rs.map((r) => r.bottom)) - top };
+}
+
+function toBox(r: { left: number; top: number; width: number; height: number }): Box {
+  return { left: r.left, top: r.top, width: r.width, height: r.height };
+}
+
+const vline = (x: number, top: number, height: number): Box => ({ left: x - 1.5, top, width: 3, height: Math.max(height, 18) });
+const hline = (left: number, y: number, width: number): Box => ({ left, top: y - 1.5, width: Math.max(width, 24), height: 3 });
+
+// Pointer position during a drag (falls back to the dragged item's centre for keyboard drags)
+function pointerOf(e: DragMoveEvent | DragEndEvent) {
+  const ev = e.activatorEvent;
+  let x: number | null = null;
+  let y: number | null = null;
+  if (typeof TouchEvent !== "undefined" && ev instanceof TouchEvent) {
+    const t = ev.touches[0] ?? ev.changedTouches[0];
+    if (t) {
+      x = t.clientX;
+      y = t.clientY;
+    }
+  } else if (ev instanceof MouseEvent) {
+    x = ev.clientX;
+    y = ev.clientY;
+  }
+  if (x === null || y === null) {
+    const r = e.active.rect.current.translated;
+    return r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
+  }
+  return { x: x + e.delta.x, y: y + e.delta.y };
+}
+
+function computeDrop(opts: {
+  shelfId: string;
+  depth: number;
+  rowRect: Box;
+  x: number;
+  y: number;
+  dragId: string;
+  ids: string[];
+  get: (id: string) => Placement | undefined;
+  title: (id: string) => string;
+}): DropHint {
+  const { shelfId, depth, rowRect, x, y, dragId, ids, get, title } = opts;
+  const rows = removeBook(buildRows(ids, get), dragId);
+  const groups = rows[depth] ?? [];
+  const base = `${shelfId}|${depth}`;
+
+  const alone = (index: number, at: number): DropHint => ({
+    key: `alone|${base}|${index}`,
+    shelfId,
+    target: { kind: "alone", depth, index },
+    line: vline(at, rowRect.top + 6, rowRect.height - 10),
+    label: depth > 0 ? `${ROW_NAMES[depth]}, on its own` : "Here, on its own",
+  });
+
+  const rects = groups.map(
+    (g) => document.querySelector(`[data-group="${CSS.escape(`${base}|${g.key}`)}"]`)?.getBoundingClientRect() ?? null
+  );
+
+  for (let gi = 0; gi < groups.length; gi++) {
+    const g = groups[gi];
+    const r = rects[gi];
+    if (!r || x < r.left - 3 || x > r.right + 3) continue;
+
+    // Just above a group, or its top edge (tall books leave no room above them): a new layer on top
+    if (y >= r.top - CAP && y < r.top + Math.min(24, r.height * 0.2)) {
+      const top = g.layers[g.layers.length - 1];
+      return {
+        key: `top|${base}|${g.key}`,
+        shelfId,
+        target: { kind: "onTop", depth, groupKey: g.key },
+        line: hline(r.left, r.top - 3, r.width),
+        box: toBox(r),
+        label: `On top of ${title(top[0])}`,
+      };
+    }
+    if (y < r.top || y > r.bottom + 2) continue;
+
+    // Inside the group: which layer, and where in it
+    const layerRects = g.layers.map((l) => union(l.map(rectOfSpine)));
+    let li = layerRects.findIndex((lr) => !!lr && y >= lr.top && y <= lr.top + lr.height);
+    if (li < 0) {
+      let best = Infinity;
+      layerRects.forEach((lr, i) => {
+        if (!lr) return;
+        const d = Math.min(Math.abs(y - lr.top), Math.abs(y - (lr.top + lr.height)));
+        if (d < best) {
+          best = d;
+          li = i;
+        }
+      });
+    }
+    if (li < 0) continue;
+    const layer = g.layers[li];
+    const lr = layerRects[li]!;
+    const bookRects = layer.map(rectOfSpine);
+    let bi = layer.findIndex((_, i) => !!bookRects[i] && x < bookRects[i]!.left + bookRects[i]!.width / 2);
+    if (bi < 0) bi = layer.length;
+    const besideX = bi < layer.length && bookRects[bi] ? bookRects[bi]!.left - 1 : lr.left + lr.width + 1;
+    const count = g.layers.reduce((n, l) => n + l.length, 0);
+
+    if (count === 1) {
+      // A book on its own: the outer thirds put the dragged book beside it as a
+      // separate book; the middle joins it, so things can later go across both
+      const rel = (x - r.left) / Math.max(1, r.width);
+      if (rel < 0.3) return alone(gi, r.left - 2);
+      if (rel > 0.7) return alone(gi + 1, r.right + 2);
+      const index = rel < 0.5 ? 0 : 1;
+      return {
+        key: `join|${base}|${g.key}|${index}`,
+        shelfId,
+        target: { kind: "beside", depth, groupKey: g.key, layer: 0, index },
+        line: vline(index === 0 ? r.left - 1 : r.right + 1, r.top, r.height),
+        box: toBox(r),
+        label: `Beside ${title(layer[0])}, as one stack`,
+      };
+    }
+
+    // The outer edge of a stack's bottom layer: leave the stack
+    if (li === 0) {
+      const edge = Math.min(10, lr.width * 0.15);
+      if (x < lr.left + edge) return alone(gi, r.left - 2);
+      if (x > lr.left + lr.width - edge) return alone(gi + 1, r.right + 2);
+    }
+
+    // A layer of flat books: top or bottom third slots in a new layer
+    if (layer.every((id) => get(id)?.orientation === "flat")) {
+      const rel = (y - lr.top) / Math.max(1, lr.height);
+      if (rel < 0.33)
+        return {
+          key: `above|${base}|${g.key}|${li}`,
+          shelfId,
+          target: { kind: "layer", depth, groupKey: g.key, layer: li, where: "above" },
+          line: hline(lr.left, lr.top - 1, lr.width),
+          box: toBox(r),
+          label: `On top of ${title(layer[0])}`,
+        };
+      if (rel > 0.67)
+        return {
+          key: `below|${base}|${g.key}|${li}`,
+          shelfId,
+          target: { kind: "layer", depth, groupKey: g.key, layer: li, where: "below" },
+          line: hline(lr.left, lr.top + lr.height + 1, lr.width),
+          box: toBox(r),
+          label: `Under ${title(layer[0])}`,
+        };
+    }
+
+    return {
+      key: `beside|${base}|${g.key}|${li}|${bi}`,
+      shelfId,
+      target: { kind: "beside", depth, groupKey: g.key, layer: li, index: bi },
+      line: vline(besideX, lr.top, lr.height),
+      box: toBox(r),
+      label: `Beside ${title(layer[Math.min(bi, layer.length - 1)])}${g.layers.length > 1 ? ` (layer ${li + 1})` : ""}`,
+    };
+  }
+
+  // Not over a group: its own spot in the row
+  let index = groups.length;
+  for (let gi = 0; gi < groups.length; gi++) {
+    const r = rects[gi];
+    if (r && x < r.left + r.width / 2) {
+      index = gi;
+      break;
+    }
+  }
+  const at = index < groups.length && rects[index] ? rects[index]!.left - 2 : index > 0 && rects[index - 1] ? rects[index - 1]!.right + 2 : rowRect.left + 16;
+  return alone(index, at);
+}
 
 function shelfName(shelf: Shelf, count: number) {
   if (shelf.label) return shelf.label;
@@ -143,12 +343,20 @@ export default function ShelvesPage() {
   const [caseError, setCaseError] = useState("");
   const [scanOpen, setScanOpen] = useState(false);
   const [scanShelf, setScanShelf] = useState<string | null>(null);
+  const [editing, setEditing] = useState<string | null>(null);
 
   // ---------- Drag ----------
   const [activeId, setActiveId] = useState<string | null>(null);
-  const snapshotRef = useRef<Layout | null>(null);
+  const [dragOrientation, setDragOrientation] = useState<Orientation>("upright");
+  const dragOrientationRef = useRef<Orientation>("upright");
+  dragOrientationRef.current = dragOrientation;
+  const [hint, setHint] = useState<DropHint | null>(null);
+  const hintRef = useRef<DropHint | null>(null);
+  const pointerRef = useRef<{ x: number; y: number } | null>(null); // the real pointer, kept current while dragging
   const layoutRef = useRef(layout);
   layoutRef.current = layout;
+  const placementsRef = useRef(placements);
+  placementsRef.current = placements;
   const [pendingFind, setPendingFind] = useState<string | null>(null);
 
   const sensors = useSensors(
@@ -240,14 +448,12 @@ export default function ShelvesPage() {
       if (!shelf) return null;
       const bookcase = bookcases.find((c) => c.id === shelf.bookcase_id);
       const count = shelvesByCase.get(shelf.bookcase_id)?.length ?? 1;
-      const ids = layout[sid];
-      const n = ids.indexOf(bookId) + 1;
+      const rows = buildRows(layout[sid] ?? [], (id) => placements[id]);
       const flat = placements[bookId]?.orientation === "flat";
-      const side = n <= Math.ceil(ids.length / 2) ? `${ordinal(n)} from the left` : `${ordinal(ids.length - n + 1)} from the right`;
       return {
         shelf,
         place: bookcase?.name ?? "Bookcase",
-        detail: `${shelfName(shelf, count)} · ${flat ? "lying flat, " : ""}${side}`,
+        detail: `${shelfName(shelf, count)} · ${flat ? "lying flat · " : ""}${describeSpot(rows, bookId)}`,
       };
     },
     [layout, shelves, bookcases, shelvesByCase, placements]
@@ -306,7 +512,16 @@ export default function ShelvesPage() {
         .filter((c) => c !== TRAY && next[c])
         .map((c) => ({
           shelf_id: c,
-          items: next[c].map((id) => ({ book_id: id, orientation: nextPlacements[id]?.orientation ?? ("upright" as Orientation) })),
+          items: next[c].map((id) => {
+            const p = nextPlacements[id];
+            return {
+              book_id: id,
+              orientation: (p?.orientation === "flat" ? "flat" : "upright") as Orientation,
+              depth: p?.depth ?? 0,
+              layer: p?.layer ?? 0,
+              stack_key: p?.stack_key ?? null,
+            };
+          }),
         }));
 
       try {
@@ -316,18 +531,14 @@ export default function ShelvesPage() {
           const out = { ...cur };
           for (const c of containers) {
             next[c]?.forEach((id, i) => {
-              const base: Placement = out[id] ?? {
-                book_id: id,
-                shelf_id: null,
-                position: null,
-                orientation: "upright",
-                spine_color: null,
-                spine_path: null,
-                spine_ratio: null,
-              };
+              const base = out[id] ?? emptyPlacement(id);
+              const draft = nextPlacements[id] ?? base;
               out[id] = {
                 ...base,
-                orientation: nextPlacements[id]?.orientation ?? base.orientation,
+                orientation: draft.orientation,
+                stack_key: draft.stack_key,
+                depth: draft.depth,
+                layer: draft.layer,
                 shelf_id: c === TRAY ? null : c,
                 position: c === TRAY ? null : i,
               };
@@ -355,89 +566,154 @@ export default function ShelvesPage() {
   // Drag and drop
   // ============================================================
 
-  function onDragStart(e: DragStartEvent) {
-    snapshotRef.current = cloneLayout(layoutRef.current);
-    setActiveId(String(e.active.id));
-  }
-
-  function onDragMove(e: DragMoveEvent) {
-    const { active, over } = e;
-    if (!over) return;
-    const rect = active.rect.current.translated;
-    if (!rect) return;
-
-    const id = String(active.id);
-    const to = String(over.data.current?.container ?? over.id);
+  // Apply a move locally straight away, then save it (rolls back on failure)
+  async function commitMove(bookId: string, toShelf: string | null, target: Target, orientation: Orientation) {
     const current = layoutRef.current;
-    const from = containerOf(current, id);
-    if (!from || !current[to]) return;
+    const currentPlacements = placementsRef.current;
+    const from = containerOf(current, bookId);
+    const fromShelf = from && from !== TRAY ? from : null;
+    const dest = target.kind === "tray" ? null : toShelf;
 
-    const without = current[to].filter((x) => x !== id);
-    const index = indexFromPoint(without, rect.left + rect.width / 2, rect.top + rect.height / 2);
+    const shelfIds: Record<string, string[]> = {};
+    if (fromShelf) shelfIds[fromShelf] = current[fromShelf] ?? [];
+    if (dest) shelfIds[dest] = current[dest] ?? [];
 
-    if (from === to && current[to].indexOf(id) === index) return;
+    const result = moveBook(shelfIds, (id) => currentPlacements[id], bookId, fromShelf, dest, target, orientation);
 
     const next = cloneLayout(current);
-    next[from] = next[from].filter((x) => x !== id);
-    next[to] = [...without.slice(0, index), id, ...without.slice(index)];
+    Object.entries(result.ids).forEach(([sid, ids]) => (next[sid] = ids));
+    next[TRAY] = (next[TRAY] ?? []).filter((x) => x !== bookId);
+    if (!dest) next[TRAY] = sortTray([...next[TRAY], bookId]);
+
+    const nextPlacements: Record<string, Placement> = { ...currentPlacements };
+    for (const [id, f] of Object.entries(result.fields)) {
+      const prev = nextPlacements[id] ?? emptyPlacement(id);
+      nextPlacements[id] = { ...prev, depth: f.depth, layer: f.layer, stack_key: f.stack_key, orientation: f.orientation ?? prev.orientation };
+    }
+
+    // Nothing actually changed (dropped back where it was)
+    const changed = Object.keys(result.ids).filter((sid) => {
+      if ((current[sid] ?? []).join("|") !== result.ids[sid].join("|")) return true;
+      return result.ids[sid].some((id) => {
+        const a = currentPlacements[id];
+        const b = nextPlacements[id];
+        return a?.depth !== b.depth || a?.layer !== b.layer || (a?.stack_key ?? null) !== (b.stack_key ?? null) || a?.orientation !== b.orientation;
+      });
+    });
+    if (changed.length === 0 && (from === TRAY) === !dest) return true;
+
     setLayout(next);
-  }
-
-  function onDragEnd(_e: DragEndEvent) {
-    const before = snapshotRef.current;
-    snapshotRef.current = null;
-    setActiveId(null);
-    if (!before) return;
-
-    const next = cloneLayout(layoutRef.current);
-    next[TRAY] = sortTray(next[TRAY] ?? []);
-    setLayout(next);
-
-    const changed = Object.keys(next).filter((k) => k !== TRAY && (before[k] ?? []).join("|") !== next[k].join("|"));
-    if (changed.length === 0) return;
-
-    const previousPlacements = placements;
-    persist(changed, next, placements, () => {
-      setLayout(before);
-      setPlacements(previousPlacements);
+    setPlacements(nextPlacements);
+    return persist(Object.keys(result.ids), next, nextPlacements, () => {
+      setLayout(current);
+      setPlacements(currentPlacements);
     });
   }
 
-  function onDragCancel() {
-    if (snapshotRef.current) setLayout(snapshotRef.current);
-    snapshotRef.current = null;
-    setActiveId(null);
+  function setDropHint(next: DropHint | null) {
+    if (hintRef.current?.key === next?.key && hintRef.current?.line?.left === next?.line?.left && hintRef.current?.box?.top === next?.box?.top) return;
+    hintRef.current = next;
+    setHint(next);
   }
+
+  function onDragStart(e: DragStartEvent) {
+    const id = String(e.active.id);
+    pointerRef.current = null;
+    setActiveId(id);
+    setDragOrientation(placementsRef.current[id]?.orientation === "flat" ? "flat" : "upright");
+    setDropHint(null);
+  }
+
+  function onDragMove(e: DragMoveEvent) {
+    const over = e.over;
+    // The drag offset ignores page scrolling, so prefer the tracked pointer
+    const point = pointerRef.current ?? pointerOf(e);
+    if (!over || !point) return setDropHint(null);
+
+    const id = String(e.active.id);
+    const data = over.data.current as { container?: string; depth?: number; tab?: boolean } | undefined;
+    const container = String(data?.container ?? over.id);
+
+    if (container === TRAY) {
+      return setDropHint({ key: "tray", shelfId: null, target: { kind: "tray" }, box: toBox(over.rect), label: "Take it off the shelf" });
+    }
+    const depth = data?.depth ?? 0;
+    if (data?.tab) {
+      const count = buildRows(layoutRef.current[container] ?? [], (b) => placementsRef.current[b])[depth]?.length ?? 0;
+      return setDropHint({
+        key: `tab|${container}|${depth}`,
+        shelfId: container,
+        target: { kind: "alone", depth, index: count },
+        box: toBox(over.rect),
+        label: `Move to the ${ROW_NAMES[depth].toLowerCase()}`,
+      });
+    }
+
+    setDropHint(
+      computeDrop({
+        shelfId: container,
+        depth,
+        rowRect: toBox(over.rect),
+        x: point.x,
+        y: point.y,
+        dragId: id,
+        ids: layoutRef.current[container] ?? [],
+        get: (b) => placementsRef.current[b],
+        title: (b) => bookMap.get(b)?.title ?? "a book",
+      })
+    );
+  }
+
+  function onDragEnd(e: DragEndEvent) {
+    const id = String(e.active.id);
+    const drop = hintRef.current;
+    setActiveId(null);
+    setDropHint(null);
+    if (!drop) return; // the last guide shown is what the reader saw, even if the pointer just left
+    commitMove(id, drop.shelfId, drop.target, drop.target.kind === "tray" ? "upright" : dragOrientationRef.current);
+  }
+
+  function onDragCancel() {
+    setActiveId(null);
+    setDropHint(null);
+  }
+
+  // Track the real pointer while dragging (mouse, pen or touch)
+  useEffect(() => {
+    if (!activeId) return;
+    const onPointer = (e: MouseEvent) => (pointerRef.current = { x: e.clientX, y: e.clientY });
+    const onTouch = (e: TouchEvent) => {
+      const t = e.touches[0];
+      if (t) pointerRef.current = { x: t.clientX, y: t.clientY };
+    };
+    window.addEventListener("pointermove", onPointer, { passive: true });
+    window.addEventListener("mousemove", onPointer, { passive: true });
+    window.addEventListener("touchmove", onTouch, { passive: true });
+    return () => {
+      window.removeEventListener("pointermove", onPointer);
+      window.removeEventListener("mousemove", onPointer);
+      window.removeEventListener("touchmove", onTouch);
+    };
+  }, [activeId]);
+
+  // Press R while dragging to lay the book flat or stand it up
+  useEffect(() => {
+    if (!activeId) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "r" || e.key === "R") setDragOrientation((o) => (o === "flat" ? "upright" : "flat"));
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [activeId]);
 
   // ============================================================
   // Move sheet
   // ============================================================
 
   async function applyMove(move: MoveRequest) {
-    const before = cloneLayout(layout);
-    const previousPlacements = placements;
-    const from = containerOf(layout, move.bookId) ?? TRAY;
-    const to = move.shelfId ?? TRAY;
-
-    const next = cloneLayout(layout);
-    Object.keys(next).forEach((k) => (next[k] = next[k].filter((x) => x !== move.bookId)));
-    if (to === TRAY) next[TRAY] = sortTray([...next[TRAY], move.bookId]);
-    else next[to].splice(Math.min(move.index, next[to].length), 0, move.bookId);
-
-    const nextPlacements = {
-      ...placements,
-      [move.bookId]: { ...(placements[move.bookId] ?? { book_id: move.bookId, shelf_id: null, position: null, spine_color: null, spine_path: null, spine_ratio: null }), orientation: move.orientation },
-    } as Record<string, Placement>;
-
+    const to = move.target.kind === "tray" ? TRAY : move.shelfId ?? TRAY;
     setSavingMove(true);
-    setLayout(next);
-    setPlacements(nextPlacements);
-
-    const ok = await persist(Array.from(new Set([from, to])), next, nextPlacements, () => {
-      setLayout(before);
-      setPlacements(previousPlacements);
-    });
-
+    const ok = await commitMove(move.bookId, move.shelfId, move.target, move.orientation);
     setSavingMove(false);
     if (!ok) return;
 
@@ -529,12 +805,13 @@ export default function ShelvesPage() {
   const movingShelf = moving ? containerOf(layout, moving) : null;
 
   return (
-    <main className="min-h-screen bg-[#fdfaf3] text-[#0f172a] font-sans selection:bg-[#d8d0e3] selection:text-[#0f172a] overflow-x-clip">
+    <main className={`${activeId ? "is-dragging " : ""}min-h-screen bg-[#fdfaf3] text-[#0f172a] font-sans selection:bg-[#d8d0e3] selection:text-[#0f172a] overflow-x-clip`}>
       <style
         dangerouslySetInnerHTML={{
           __html: `
             @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,500;0,600;0,700;1,400;1,600&display=swap');
             .font-classical { font-family: 'Playfair Display', Georgia, serif; }
+            .is-dragging .spine-btn { translate: none !important; transform: none !important; } /* no hover lift while dragging */
             .shelf-scroll { scrollbar-width: thin; scrollbar-color: rgba(253,250,243,0.25) transparent; scroll-behavior: smooth; }
             @media (prefers-reduced-motion: reduce) { .shelf-scroll { scroll-behavior: auto; } }
           `,
@@ -670,7 +947,7 @@ export default function ShelvesPage() {
 
               {arranging && (
                 <p className="mt-2.5 text-xs text-[#4a5c4b] bg-[#eef3ee] rounded-xl px-3 py-2">
-                  Drag books between shelves (on a phone, press and hold first). Tap a book to place it exactly or lay it flat. Changes save as you go.
+                  Drag a book (on a phone, press and hold first): just above another book stacks it on top, onto a stack&apos;s side puts it beside, and the row tabs on each shelf move books behind. Press R while dragging to lay a book flat or stand it up. Tap a book to place it exactly. Changes save as you go.
                 </p>
               )}
             </div>
@@ -680,6 +957,7 @@ export default function ShelvesPage() {
               collisionDetection={collision}
               onDragStart={onDragStart}
               onDragMove={onDragMove}
+              onDragOver={onDragMove} /* the target from a move event can lag a step behind; recheck when it changes */
               onDragEnd={onDragEnd}
               onDragCancel={onDragCancel}
               accessibility={{
@@ -749,24 +1027,73 @@ export default function ShelvesPage() {
                         usePhoto,
                         shelfHeight,
                       }}
-                      orientation={activePlacement?.orientation ?? "upright"}
+                      orientation={dragOrientation}
                       lifted
                     />
                   </div>
                 ) : null}
               </DragOverlay>
+
+              {/* Where it will land */}
+              {activeId && hint && (
+                <div aria-hidden="true" className="pointer-events-none fixed inset-0 z-[60]">
+                  {hint.box && (
+                    <div
+                      className="absolute rounded-lg ring-2 ring-[#e8c873]/80 bg-[#e8c873]/10 transition-all duration-100"
+                      style={{ left: hint.box.left - 4, top: hint.box.top - 4, width: hint.box.width + 8, height: hint.box.height + 8 }}
+                    />
+                  )}
+                  {hint.line && (
+                    <div className="absolute rounded-full bg-[#e8c873] shadow-[0_0_14px_#e8c873] transition-all duration-100" style={hint.line} />
+                  )}
+                  <div
+                    className="absolute -translate-x-1/2 -translate-y-full whitespace-nowrap rounded-full bg-[#0f172a] text-[#fdfaf3] text-[11px] font-semibold px-2.5 py-1 shadow-lg"
+                    style={{
+                      left: Math.min(Math.max((hint.line ?? hint.box)!.left + (hint.line ?? hint.box)!.width / 2, 90), (typeof window !== "undefined" ? window.innerWidth : 1200) - 90),
+                      top: Math.max(30, Math.min(hint.line?.top ?? Infinity, hint.box?.top ?? Infinity) - 10),
+                    }}
+                  >
+                    {hint.label}
+                    {hint.target.kind !== "tray" && <span className="ml-1.5 text-[#e8c873]">· {dragOrientation === "flat" ? "flat" : "standing"}</span>}
+                  </div>
+                </div>
+              )}
             </DndContext>
           </>
         )}
       </div>
 
       {/* ================= Overlays ================= */}
-      <FindSpotlight target={find} onClose={() => setFind(null)} />
+      <FindSpotlight
+        target={find}
+        onClose={() => setFind(null)}
+        onEdit={(id) => {
+          setFind(null);
+          setEditing(id);
+        }}
+      />
+
+      {userId && (
+        <SpineEditorSheet
+          book={editing ? bookMap.get(editing) ?? null : null}
+          placement={editing ? placements[editing] : undefined}
+          photoUrl={editing && placements[editing]?.spine_path ? photos[placements[editing]!.spine_path!] ?? null : null}
+          pagePrefersPhoto={usePhoto}
+          userId={userId}
+          onClose={() => setEditing(null)}
+          onSaved={(saved, url) => {
+            setPlacements((cur) => ({ ...cur, [saved.book_id]: { ...(cur[saved.book_id] ?? emptyPlacement(saved.book_id)), ...saved } }));
+            if (saved.spine_path && url) setPhotos((cur) => ({ ...cur, [saved.spine_path!]: url }));
+            setEditing(null);
+            showToast("success", "Spine updated.");
+          }}
+        />
+      )}
 
       <MoveBookSheet
         book={movingBook}
         currentShelfId={movingShelf}
-        orientation={moving ? placements[moving]?.orientation ?? "upright" : "upright"}
+        placements={placementMap}
         bookcases={bookcases}
         shelves={shelves}
         layout={layout}
@@ -774,6 +1101,10 @@ export default function ShelvesPage() {
         saving={savingMove}
         onClose={() => setMoving(null)}
         onSave={applyMove}
+        onEditLook={(id) => {
+          setMoving(null);
+          setEditing(id);
+        }}
       />
 
       <BookcaseSheet

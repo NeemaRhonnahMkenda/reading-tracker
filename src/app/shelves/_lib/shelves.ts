@@ -8,6 +8,9 @@ import { supabase } from "../../../lib/supabase";
 // ============================================================
 
 export type Orientation = "upright" | "flat";
+export type SpineStyle = "auto" | "photo" | "painted";
+export type SpineText = "auto" | "light" | "dark";
+export type SpineFont = "serif" | "sans";
 
 export interface ShelfBook {
   id: string;
@@ -40,6 +43,45 @@ export interface Placement {
   spine_color: string | null;
   spine_path: string | null;
   spine_ratio: number | null;
+  stack_key: string | null; // books with the same key form one group (null = on its own)
+  depth: number; // 0 = front row, 1 = behind it, 2 = at the back
+  layer: number; // 0 = on the shelf, 1 = on top of layer 0, …
+  spine_style: SpineStyle;
+  spine_text: SpineText;
+  spine_font: SpineFont;
+  height_ratio: number | null;
+  photo_flip: boolean;
+  photo_brightness: number;
+}
+
+// The parts of a placement that change how a spine looks
+export type SpineLookFields = Pick<
+  Placement,
+  "spine_style" | "spine_text" | "spine_font" | "spine_color" | "spine_ratio" | "height_ratio" | "photo_flip" | "photo_brightness" | "spine_path"
+>;
+
+export const PLACEMENT_COLUMNS =
+  "book_id, shelf_id, position, orientation, spine_color, spine_path, spine_ratio, stack_key, depth, layer, spine_style, spine_text, spine_font, height_ratio, photo_flip, photo_brightness";
+
+export function emptyPlacement(bookId: string): Placement {
+  return {
+    book_id: bookId,
+    shelf_id: null,
+    position: null,
+    orientation: "upright",
+    spine_color: null,
+    spine_path: null,
+    spine_ratio: null,
+    stack_key: null,
+    depth: 0,
+    layer: 0,
+    spine_style: "auto",
+    spine_text: "auto",
+    spine_font: "serif",
+    height_ratio: null,
+    photo_flip: false,
+    photo_brightness: 1,
+  };
 }
 
 export interface ShelvesData {
@@ -67,7 +109,7 @@ export async function loadShelvesData(userId: string): Promise<ShelvesData> {
     supabase.from("shelves").select("id, bookcase_id, position, label").eq("user_id", userId).order("position"),
     supabase
       .from("shelf_placements")
-      .select("book_id, shelf_id, position, orientation, spine_color, spine_path, spine_ratio")
+      .select(PLACEMENT_COLUMNS)
       .eq("user_id", userId),
     supabase
       .from("books")
@@ -96,7 +138,7 @@ export function buildLayout(data: ShelvesData): Layout {
   const placed = new Map(data.placements.map((p) => [p.book_id, p]));
   const sorted = [...data.placements]
     .filter((p) => p.shelf_id && layout[p.shelf_id])
-    .sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+    .sort((a, b) => (a.depth ?? 0) - (b.depth ?? 0) || (a.position ?? 0) - (b.position ?? 0));
 
   sorted.forEach((p) => layout[p.shelf_id!].push(p.book_id));
 
@@ -113,7 +155,10 @@ export function buildLayout(data: ShelvesData): Layout {
 // ============================================================
 
 export async function applyLayout(
-  shelves: { shelf_id: string; items: { book_id: string; orientation: Orientation }[] }[]
+  shelves: {
+    shelf_id: string;
+    items: { book_id: string; orientation: Orientation; depth: number; layer: number; stack_key: string | null }[];
+  }[]
 ) {
   if (shelves.length === 0) return;
   const { error } = await supabase.rpc("apply_shelf_layout", { p_shelves: shelves });
@@ -146,9 +191,15 @@ export async function removeShelf(shelfId: string) {
   if (error) throw error;
 }
 
-export async function setOrientation(bookId: string, orientation: Orientation) {
-  const { error } = await supabase.from("shelf_placements").update({ orientation }).eq("book_id", bookId);
+// Save how a spine looks. Creates the placement row if the book has never been placed.
+export async function saveSpineLook(userId: string, bookId: string, look: Partial<SpineLookFields>) {
+  const { data, error } = await supabase
+    .from("shelf_placements")
+    .upsert({ book_id: bookId, user_id: userId, ...look }, { onConflict: "book_id" })
+    .select(PLACEMENT_COLUMNS)
+    .single();
   if (error) throw error;
+  return data as Placement;
 }
 
 // ============================================================
@@ -199,13 +250,15 @@ function hash(text: string) {
 }
 
 // Muted cloth-binding colours that sit well on cream and wood
-const PAINTED = ["#1e2a44", "#3d5a45", "#7a3f33", "#a47a25", "#5f4f7a", "#2f5d62", "#8a5a44", "#4a4e57", "#6d7f9c", "#b98f6b", "#2b2b2b", "#7a947c"];
+export const PAINTED = ["#1e2a44", "#3d5a45", "#7a3f33", "#a47a25", "#5f4f7a", "#2f5d62", "#8a5a44", "#4a4e57", "#6d7f9c", "#b98f6b", "#2b2b2b", "#7a947c"];
 
 export function paintedColor(book: Pick<ShelfBook, "id" | "title">) {
   return PAINTED[hash(book.id + book.title) % PAINTED.length];
 }
 
-export function readableText(hex: string) {
+export function readableText(hex: string, mode: SpineText = "auto") {
+  if (mode === "light") return "#fdfaf3";
+  if (mode === "dark") return "#0f172a";
   const n = parseInt(hex.slice(1), 16);
   const [r, g, b] = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((v) => {
     const c = v / 255;
@@ -216,8 +269,16 @@ export function readableText(hex: string) {
 }
 
 // How tall the book stands, as a share of the shelf's inner height (0.74 to 0.97)
-export function heightRatio(bookId: string) {
-  return 0.74 + (hash(bookId) % 24) / 100;
+export function heightRatio(bookId: string, placement?: Placement) {
+  return placement?.height_ratio ?? 0.74 + (hash(bookId) % 24) / 100;
+}
+
+// Photo when there is one, unless this book (or the page) says painted
+export function showsPhoto(placement: Placement | undefined, photo: string | null, pagePrefersPhoto: boolean) {
+  if (!photo || !placement?.spine_path) return false;
+  if (placement.spine_style === "photo") return true;
+  if (placement.spine_style === "painted") return false;
+  return pagePrefersPhoto;
 }
 
 // Spine thickness ÷ book height: from a scan, or guessed from the page count
