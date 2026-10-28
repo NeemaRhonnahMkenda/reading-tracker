@@ -105,3 +105,61 @@ export async function makeShot(crop: HTMLCanvasElement): Promise<SpineShot> {
     ratio: Math.min(0.4, Math.max(0.012, uprightW / uprightH)),
   };
 }
+
+// ------------------------------------------------------------
+// Photo mode: capture extra around the guide so the crop can be adjusted
+// ------------------------------------------------------------
+
+/** A crop region as fractions (0..1) of the captured picture. */
+export interface CropRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export const FULL_RECT: CropRect = { x: 0, y: 0, w: 1, h: 1 };
+
+/**
+ * Like cropFromVideo, but takes in extra on every side (marginX × the guide's
+ * width, marginY × its height). Returns the picture and where the guide sits in it.
+ */
+export function cropWithMargin(
+  video: HTMLVideoElement,
+  viewW: number,
+  viewH: number,
+  guide: GuideBox,
+  marginX = 0.7,
+  marginY = 0.06
+): { canvas: HTMLCanvasElement; inner: CropRect } | null {
+  const left = Math.max(0, guide.x - guide.w * marginX);
+  const top = Math.max(0, guide.y - guide.h * marginY);
+  const right = Math.min(1, guide.x + guide.w * (1 + marginX));
+  const bottom = Math.min(1, guide.y + guide.h * (1 + marginY));
+  const outer = { x: left, y: top, w: right - left, h: bottom - top };
+
+  const canvas = cropFromVideo(video, viewW, viewH, outer);
+  if (!canvas) return null;
+  return {
+    canvas,
+    inner: {
+      x: (guide.x - outer.x) / outer.w,
+      y: (guide.y - outer.y) / outer.h,
+      w: guide.w / outer.w,
+      h: guide.h / outer.h,
+    },
+  };
+}
+
+/** Cut a region (fractions) out of a picture. */
+export function trimCanvas(source: HTMLCanvasElement, rect: CropRect) {
+  const sx = Math.round(rect.x * source.width);
+  const sy = Math.round(rect.y * source.height);
+  const sw = Math.max(2, Math.round(rect.w * source.width));
+  const sh = Math.max(2, Math.round(rect.h * source.height));
+  const out = document.createElement("canvas");
+  out.width = sw;
+  out.height = sh;
+  out.getContext("2d")!.drawImage(source, sx, sy, sw, sh, 0, 0, sw, sh);
+  return out;
+}

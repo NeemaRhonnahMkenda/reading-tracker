@@ -16,13 +16,22 @@ import { supabase } from "../../../lib/supabase";
 import { SPINE_BUCKET, TRAY, type Bookcase, type Layout, type Shelf, type ShelfBook } from "../_lib/shelves";
 import { createSpineReader, type SpineReader } from "../_lib/ocr";
 import { indexBooks, matchLevel, rankBooks, type MatchCandidate } from "../_lib/match";
-import { canvasFromFile, makeShot, type SpineShot } from "../_lib/spineCapture";
+import { FULL_RECT, canvasFromFile, makeShot, trimCanvas, type CropRect, type SpineShot } from "../_lib/spineCapture";
 import SpineViewfinder from "./SpineViewfinder";
+import SpineCropper from "./SpineCropper";
 
 type Step = "setup" | "scan";
 
+// The picture a spine strip was cut from, so the crop can be adjusted later
+interface SpineSource {
+  picture: HTMLCanvasElement;
+  rect: CropRect;
+}
+
 interface Proposal {
   shot: SpineShot;
+  source: SpineSource;
+  ownPhoto: boolean; // false = the frame auto-captured while reading
   text: string;
   candidates: MatchCandidate[];
   bookId: string; // "" = nothing in the library matched
@@ -32,7 +41,14 @@ interface Captured {
   key: string;
   bookId: string;
   shot: SpineShot;
+  source: SpineSource;
+  ownPhoto: boolean;
 }
+
+// Whose spine photo is being taken or adjusted: the match on screen, or a book already added
+type PhotoTarget = "proposal" | string;
+
+const ASK_PHOTO_KEY = "archive:scan-ask-photo";
 
 const AUTO_ACCEPT = 0.55; // a match this good, seen twice in a row, pops up for confirmation
 const INSTANT_ACCEPT = 0.82; // this good: pops up straight away
@@ -101,7 +117,36 @@ export default function ScanShelfSheet({
   capturedRef.current = captured;
   const photoRef = useRef<HTMLInputElement | null>(null);
 
+  // Spine photos: take your own, adjust the crop, or choose one
+  const [askPhoto, setAskPhoto] = useState(true);
+  const [photoFor, setPhotoFor] = useState<PhotoTarget | null>(null);
+  const [cropping, setCropping] = useState<{ target: PhotoTarget; picture: HTMLCanvasElement; rect: CropRect } | null>(null);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const spineFileRef = useRef<HTMLInputElement | null>(null);
+  const spineFileTargetRef = useRef<PhotoTarget | null>(null);
+
+  useEffect(() => {
+    try {
+      if (localStorage.getItem(ASK_PHOTO_KEY) === "0") setAskPhoto(false);
+    } catch {
+      // storage unavailable
+    }
+  }, []);
+
+  function changeAskPhoto(value: boolean) {
+    setAskPhoto(value);
+    try {
+      localStorage.setItem(ASK_PHOTO_KEY, value ? "1" : "0");
+    } catch {
+      // storage unavailable
+    }
+  }
+
   const bookMap = useMemo(() => new Map(books.map((b) => [b.id, b])), [books]);
+  const photoTitle = (target: PhotoTarget) => {
+    const id = target === "proposal" ? proposal?.bookId : captured.find((c) => c.key === target)?.bookId;
+    return (id && bookMap.get(id)?.title) || "this book";
+  };
   const index = useMemo(() => indexBooks(books), [books]);
 
   const shelvesByCase = useMemo(() => {
@@ -138,6 +183,9 @@ export default function ScanShelfSheet({
     setCaptured([]);
     setSearch("");
     setError("");
+    setPhotoFor(null);
+    setCropping(null);
+    setExpanded(null);
     streakRef.current = { bookId: "", count: 0 };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
@@ -219,8 +267,13 @@ export default function ScanShelfSheet({
     streakRef.current = { bookId: "", count: 0 };
     const usable = best && best.score >= 0.33 ? best.bookId : "";
     setSearch("");
-    setProposal({ shot: await makeShot(crop), text: read.text, candidates, bookId: usable });
+    setProposal({ shot: await makeShot(crop), source: { picture: crop, rect: FULL_RECT }, ownPhoto: false, text: read.text, candidates, bookId: usable });
     navigator.vibrate?.(25);
+    // Found it: now take the spine photo you actually want to keep
+    if (askPhoto && usable) {
+      setCropping(null);
+      setPhotoFor("proposal");
+    }
   }
 
   async function readPhoto(file: File | undefined) {
@@ -241,11 +294,69 @@ export default function ScanShelfSheet({
   function confirm() {
     if (!proposal?.bookId || alreadyAdded(proposal.bookId) >= 0) return;
     const book = bookMap.get(proposal.bookId);
-    setCaptured((cur) => [...cur, { key: crypto.randomUUID(), bookId: proposal.bookId, shot: proposal.shot }]);
-    setProposal(null);
+    setCaptured((cur) => [
+      ...cur,
+      { key: crypto.randomUUID(), bookId: proposal.bookId, shot: proposal.shot, source: proposal.source, ownPhoto: proposal.ownPhoto },
+    ]);
+    clearProposal();
     setLiveText("");
     setFlash(`Added ${book?.title ?? "book"}. Next spine to the right.`);
     navigator.vibrate?.([20, 40, 20]);
+  }
+
+  function clearProposal() {
+    setProposal(null);
+    if (photoFor === "proposal") setPhotoFor(null);
+    if (cropping?.target === "proposal") setCropping(null);
+  }
+
+  // ---------- Spine photos ----------
+  function startPhoto(target: PhotoTarget) {
+    setError("");
+    setCropping(null);
+    setPhotoFor(target);
+  }
+
+  function onCapture(picture: HTMLCanvasElement, guide: CropRect) {
+    if (!photoFor) return;
+    setCropping({ target: photoFor, picture, rect: guide });
+  }
+
+  function adjustPhoto(target: PhotoTarget) {
+    const source = target === "proposal" ? proposal?.source : captured.find((c) => c.key === target)?.source;
+    if (!source) return;
+    setPhotoFor(null);
+    setCropping({ target, picture: source.picture, rect: source.rect });
+  }
+
+  function choosePhoto(target: PhotoTarget) {
+    spineFileTargetRef.current = target;
+    spineFileRef.current?.click();
+  }
+
+  async function onSpineFile(file: File | undefined) {
+    const target = spineFileTargetRef.current;
+    if (spineFileRef.current) spineFileRef.current.value = "";
+    if (!file || !target) return;
+    try {
+      const picture = await canvasFromFile(file);
+      setPhotoFor(null);
+      setCropping({ target, picture, rect: FULL_RECT });
+    } catch {
+      setError("That photo couldn't be opened. Try a JPG or PNG.");
+    }
+  }
+
+  async function applyCrop(rect: CropRect) {
+    if (!cropping) return;
+    const { target, picture } = cropping;
+    const shot = await makeShot(trimCanvas(picture, rect));
+    const source = { picture, rect };
+    if (target === "proposal") setProposal((p) => (p ? { ...p, shot, source, ownPhoto: true } : p));
+    else setCaptured((cur) => cur.map((c) => (c.key === target ? { ...c, shot, source, ownPhoto: true } : c)));
+    setCropping(null);
+    setPhotoFor(null);
+    setFlash("Spine photo saved for this book.");
   }
 
   useEffect(() => {
@@ -322,6 +433,9 @@ export default function ScanShelfSheet({
   } else if (readerState === "failed") {
     status = "The reader couldn't load. Check your connection.";
     tone = "warn";
+  } else if (photoFor) {
+    status = "Fit the spine in the frame, then tap the camera";
+    tone = "idle";
   } else if (proposal) {
     status = proposal.bookId ? "Found it. Confirm below." : "Not found in your library";
     tone = proposal.bookId ? "found" : "warn";
@@ -394,7 +508,7 @@ export default function ScanShelfSheet({
               {[
                 ["Start at the left", "Scan the books in the order they stand."],
                 ["Fit the frame", "One spine inside the gold frame; slide to match its thickness."],
-                ["Confirm", "We match it to your library. Tap Add, then move to the next."],
+                ["Confirm and photograph", "We match it to your library, then you take the spine photo to keep. Tap Add."],
               ].map(([title, text], i) => (
                 <li key={title} className="rounded-2xl bg-[#f3eee3] px-3.5 py-3">
                   <span className="text-xs font-semibold text-[#8a6a22]">{i + 1}.</span>{" "}
@@ -434,6 +548,7 @@ export default function ScanShelfSheet({
         {step === "scan" && (
           <div className="space-y-5">
             <input ref={photoRef} type="file" accept="image/*" className="sr-only" tabIndex={-1} onChange={(e) => readPhoto(e.target.files?.[0])} />
+            <input ref={spineFileRef} type="file" accept="image/*" className="sr-only" tabIndex={-1} onChange={(e) => onSpineFile(e.target.files?.[0])} />
 
             {cameraError ? (
               <div className="rounded-2xl border-2 border-dashed border-[#0f172a]/15 bg-white p-6 text-center">
@@ -444,20 +559,61 @@ export default function ScanShelfSheet({
               </div>
             ) : (
               <>
-                <SpineViewfinder
-                  paused={!!proposal || readerState !== "ready" || saving}
-                  status={status}
-                  tone={tone}
-                  onRead={handleRead}
-                  onCameraError={setCameraError}
-                />
-                <button
-                  type="button"
-                  onClick={() => photoRef.current?.click()}
-                  className={`text-xs font-medium text-slate-500 underline underline-offset-4 decoration-slate-300 hover:text-[#0f172a] rounded ${focusRing}`}
-                >
-                  Or use a photo of one spine
-                </button>
+                {photoFor && !cropping && (
+                  <div className="flex flex-wrap items-center gap-2 rounded-2xl bg-[#fbf6ea] border border-[#c69a3d]/25 px-3.5 py-2.5">
+                    <p className="basis-full sm:basis-0 sm:flex-1 min-w-0 text-sm leading-6 text-[#5b4718]">
+                      <span className="font-semibold">Spine photo</span> for{" "}
+                      <span className="font-medium">{photoTitle(photoFor)}</span>: line the spine up in the frame and tap the camera.
+                    </p>
+                    <span className="flex gap-1.5 ml-auto">
+                      <Button variant="ghost" size="sm" onClick={() => choosePhoto(photoFor)}>
+                        Choose photo
+                      </Button>
+                      <Button variant="outline" size="sm" onClick={() => setPhotoFor(null)}>
+                        {photoFor === "proposal" && !proposal?.ownPhoto ? "Use auto photo" : "Cancel"}
+                      </Button>
+                    </span>
+                  </div>
+                )}
+
+                {cropping && (
+                  <SpineCropper
+                    picture={cropping.picture}
+                    initial={cropping.rect}
+                    title={photoTitle(cropping.target)}
+                    onUse={applyCrop}
+                    onRetake={() => startPhoto(cropping.target)}
+                    onCancel={() => setCropping(null)}
+                  />
+                )}
+
+                {/* Kept mounted while cropping so the camera doesn't restart */}
+                <div className={cropping ? "hidden" : ""}>
+                  <SpineViewfinder
+                    paused={!!proposal || readerState !== "ready" || saving || !!cropping}
+                    photoMode={!!photoFor}
+                    onCapture={onCapture}
+                    status={status}
+                    tone={tone}
+                    onRead={handleRead}
+                    onCameraError={setCameraError}
+                  />
+                </div>
+                {!photoFor && !cropping && (
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <button
+                      type="button"
+                      onClick={() => photoRef.current?.click()}
+                      className={`text-xs font-medium text-slate-500 underline underline-offset-4 decoration-slate-300 hover:text-[#0f172a] rounded ${focusRing}`}
+                    >
+                      Or use a photo of one spine
+                    </button>
+                    <label className="flex items-center gap-2 text-xs text-slate-600 cursor-pointer">
+                      <input type="checkbox" checked={askPhoto} onChange={(e) => changeAskPhoto(e.target.checked)} className="w-4 h-4 accent-[#7a947c]" />
+                      Take my own spine photo after each match
+                    </label>
+                  </div>
+                )}
               </>
             )}
 
@@ -468,8 +624,13 @@ export default function ScanShelfSheet({
                 className={`rounded-2xl border p-3.5 sm:p-4 ${proposal.bookId ? "border-[#7a947c]/40 bg-[#f4f8f4]" : "border-[#e8cbc4] bg-[#fdf5f3]"}`}
               >
                 <div className="flex gap-3.5">
-                  <div className="w-11 h-28 shrink-0 rounded-md overflow-hidden ring-1 ring-[#0f172a]/10 bg-[#e9e4d9] flex items-center justify-center">
-                    <img src={proposal.shot.thumb} alt="The spine you scanned" className="max-w-full max-h-full object-contain" />
+                  <div className="shrink-0 flex flex-col items-center gap-1">
+                    <div className="w-11 h-28 rounded-md overflow-hidden ring-1 ring-[#0f172a]/10 bg-[#e9e4d9] flex items-center justify-center">
+                      <img src={proposal.shot.thumb} alt="The spine photo that will be used" className="max-w-full max-h-full object-contain" />
+                    </div>
+                    <span className={`text-[10px] font-semibold uppercase tracking-wide ${proposal.ownPhoto ? "text-[#4a5c4b]" : "text-slate-400"}`}>
+                      {proposal.ownPhoto ? "Your photo" : "Auto"}
+                    </span>
                   </div>
 
                   <div className="flex-1 min-w-0">
@@ -498,6 +659,20 @@ export default function ScanShelfSheet({
                       </>
                     )}
                   </div>
+                </div>
+
+                {/* The spine photo to keep */}
+                <div className="mt-3 flex flex-wrap items-center gap-1.5">
+                  <span className="text-xs text-slate-500 mr-1">Spine photo:</span>
+                  <Button variant={proposal.ownPhoto ? "outline" : "dark"} size="sm" onClick={() => startPhoto("proposal")} disabled={photoFor === "proposal" && !cropping}>
+                    {proposal.ownPhoto ? "Retake" : "Take photo"}
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={() => adjustPhoto("proposal")}>
+                    Adjust crop
+                  </Button>
+                  <Button variant="ghost" size="sm" onClick={() => choosePhoto("proposal")}>
+                    Choose photo
+                  </Button>
                 </div>
 
                 {/* Other close matches */}
@@ -564,7 +739,7 @@ export default function ScanShelfSheet({
                 </div>
 
                 <div className="mt-4 grid grid-cols-2 gap-2">
-                  <Button variant="outline" onClick={() => setProposal(null)}>
+                  <Button variant="outline" onClick={clearProposal}>
                     Scan again
                   </Button>
                   <Button onClick={confirm} disabled={!proposal.bookId || duplicateAt >= 0}>
@@ -592,9 +767,23 @@ export default function ScanShelfSheet({
                   {captured.map((c, i) => {
                     const book = bookMap.get(c.bookId);
                     return (
-                      <li key={c.key} className="flex items-center gap-3 rounded-2xl bg-white/80 border border-[#0f172a]/[0.07] p-2 pr-2.5">
+                      <li key={c.key} className="rounded-2xl bg-white/80 border border-[#0f172a]/[0.07] p-2 pr-2.5">
+                        <div className="flex items-center gap-3">
                         <span className="w-6 text-center text-xs font-semibold text-slate-400 tabular-nums">{i + 1}</span>
-                        <img src={c.shot.thumb} alt="" className="w-6 h-14 rounded-sm object-cover ring-1 ring-[#0f172a]/10" />
+                        <button
+                          type="button"
+                          onClick={() => setExpanded((k) => (k === c.key ? null : c.key))}
+                          aria-expanded={expanded === c.key}
+                          aria-label={`Spine photo for ${book?.title}: retake or adjust`}
+                          className={`relative shrink-0 rounded-sm ${focusRing}`}
+                        >
+                          <img src={c.shot.thumb} alt="" className="w-6 h-14 rounded-sm object-cover ring-1 ring-[#0f172a]/10" />
+                          <span aria-hidden="true" className="absolute -bottom-1 -right-1.5 w-4 h-4 rounded-full bg-[#0f172a] text-[#fdfaf3] flex items-center justify-center">
+                            <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M4 7h3l2-3h6l2 3h3v12H4z" />
+                            </svg>
+                          </span>
+                        </button>
                         <span className="flex-1 min-w-0">
                           <span className="block text-sm font-medium text-[#0f172a] truncate">{book?.title}</span>
                           {book?.author && <span className="block text-xs text-slate-500 truncate">{book.author}</span>}
@@ -615,6 +804,21 @@ export default function ScanShelfSheet({
                             ×
                           </button>
                         </span>
+                        </div>
+                        {expanded === c.key && (
+                          <div className="mt-2 ml-9 flex flex-wrap items-center gap-1.5">
+                            <span className="text-xs text-slate-500 mr-1">{c.ownPhoto ? "Your photo" : "Auto photo"}:</span>
+                            <Button variant="outline" size="sm" onClick={() => startPhoto(c.key)}>
+                              Retake
+                            </Button>
+                            <Button variant="outline" size="sm" onClick={() => adjustPhoto(c.key)}>
+                              Adjust crop
+                            </Button>
+                            <Button variant="ghost" size="sm" onClick={() => choosePhoto(c.key)}>
+                              Choose photo
+                            </Button>
+                          </div>
+                        )}
                       </li>
                     );
                   })}

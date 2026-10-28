@@ -2,12 +2,14 @@
 // Live camera with a spine-shaped guide, like the barcode scanner. Fit one
 // spine inside the frame (use the slider to match its thickness) and hold
 // still: the frame is read about twice a second until a book is recognised.
+// In photo mode, reading stops and the shutter takes the spine picture you want
+// to keep (with a little extra around it, so the crop can be adjusted after).
 
 "use client";
 
 import { ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import { focusRing } from "../../components/ui/Button";
-import { cropFromVideo, type GuideBox } from "../_lib/spineCapture";
+import { cropFromVideo, cropWithMargin, type CropRect, type GuideBox } from "../_lib/spineCapture";
 
 const GUIDE_HEIGHT = 0.86;
 
@@ -22,8 +24,12 @@ export default function SpineViewfinder({
   tone,
   onRead,
   onCameraError,
+  photoMode = false,
+  onCapture,
 }: {
   paused: boolean; // stop reading (e.g. while a match waits for confirmation)
+  photoMode?: boolean; // no reading; the shutter takes the spine photo
+  onCapture?: (picture: HTMLCanvasElement, guide: CropRect) => void;
   status: ReactNode;
   tone: "idle" | "reading" | "found" | "warn";
   onRead: (crop: HTMLCanvasElement, manual: boolean) => Promise<void>;
@@ -33,8 +39,8 @@ export default function SpineViewfinder({
   const boxRef = useRef<HTMLDivElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const busyRef = useRef(false);
-  const pausedRef = useRef(paused);
-  pausedRef.current = paused;
+  const pausedRef = useRef(paused || photoMode);
+  pausedRef.current = paused || photoMode;
   const onReadRef = useRef(onRead);
   onReadRef.current = onRead;
 
@@ -45,6 +51,7 @@ export default function SpineViewfinder({
   const [torchAvailable, setTorchAvailable] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
   const [manualBusy, setManualBusy] = useState(false);
+  const [flash, setFlash] = useState(false);
 
   // ---------- Camera ----------
   useEffect(() => {
@@ -128,6 +135,18 @@ export default function SpineViewfinder({
     };
   }, [ready, grab]);
 
+  function takePhoto() {
+    const video = videoRef.current;
+    const box = boxRef.current;
+    if (!video || !box || video.readyState < 2) return;
+    const shot = cropWithMargin(video, box.clientWidth, box.clientHeight, guideFor(thicknessRef.current));
+    if (!shot) return;
+    setFlash(true);
+    window.setTimeout(() => setFlash(false), 180);
+    navigator.vibrate?.(15);
+    onCapture?.(shot.canvas, shot.inner);
+  }
+
   async function readNow() {
     const crop = grab();
     if (!crop || busyRef.current) return;
@@ -185,8 +204,11 @@ export default function SpineViewfinder({
           {["top-0 left-0 border-t-4 border-l-4 rounded-tl-xl", "top-0 right-0 border-t-4 border-r-4 rounded-tr-xl", "bottom-0 left-0 border-b-4 border-l-4 rounded-bl-xl", "bottom-0 right-0 border-b-4 border-r-4 rounded-br-xl"].map((c) => (
             <span key={c} className={`absolute w-5 h-5 -m-[3px] ${c} ${frameColour}`} />
           ))}
-          {!paused && ready && <span className="vf-sweep absolute left-1 right-1 h-0.5 bg-[#e8c873] shadow-[0_0_12px_#e8c873]" />}
+          {!paused && !photoMode && ready && <span className="vf-sweep absolute left-1 right-1 h-0.5 bg-[#e8c873] shadow-[0_0_12px_#e8c873]" />}
         </div>
+
+        {/* Shutter flash */}
+        <div aria-hidden="true" className={`absolute inset-0 bg-white pointer-events-none transition-opacity duration-150 ${flash ? "opacity-70" : "opacity-0"}`} />
 
         {/* Status */}
         <div className="absolute top-3 inset-x-3 flex justify-center pointer-events-none">
@@ -222,12 +244,19 @@ export default function SpineViewfinder({
 
           <button
             type="button"
-            onClick={readNow}
-            disabled={!ready || paused || manualBusy}
-            aria-label="Read this spine now"
-            className={`w-16 h-16 rounded-full bg-[#fdfaf3] border-4 border-[#fdfaf3]/40 bg-clip-padding flex items-center justify-center shadow-lg disabled:opacity-40 ${focusRing}`}
+            onClick={photoMode ? takePhoto : readNow}
+            disabled={!ready || (!photoMode && (paused || manualBusy))}
+            aria-label={photoMode ? "Take the spine photo" : "Read this spine now"}
+            className={`w-16 h-16 rounded-full bg-[#fdfaf3] border-4 bg-clip-padding flex items-center justify-center shadow-lg disabled:opacity-40 ${
+              photoMode ? "border-[#e8c873] ring-4 ring-[#e8c873]/30" : "border-[#fdfaf3]/40"
+            } ${focusRing}`}
           >
-            {manualBusy ? (
+            {photoMode ? (
+              <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#0f172a" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M4 7h3l2-3h6l2 3h3v12H4z" />
+                <circle cx="12" cy="13" r="3.5" />
+              </svg>
+            ) : manualBusy ? (
               <span className="w-6 h-6 rounded-full border-2 border-[#0f172a]/20 border-t-[#0f172a] animate-spin" aria-hidden="true" />
             ) : (
               <span aria-hidden="true" className="w-11 h-11 rounded-full bg-[#0f172a]" />
