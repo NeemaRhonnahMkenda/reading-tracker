@@ -7,6 +7,7 @@ export const NAV_LINKS = [
   { href: "/library", label: "My Library" },
   { href: "/reading", label: "Reading" },
   { href: "/shelves", label: "Shelves" },
+  { href: "/games", label: "Games" },
   { href: "/wishlist", label: "Wishlist" },
   { href: "/family", label: "Family" },
   { href: "/diary", label: "Diary" },
@@ -16,7 +17,7 @@ export const NAV_LINKS = [
 export const PROTECTED_PAGES: readonly string[] = [...NAV_LINKS.map((link) => link.href), "/profile"];
 
 // API routes that need a signed-in user (answered with 401 JSON, not a redirect)
-export const PROTECTED_API: readonly string[] = ["/api/books"];
+export const PROTECTED_API: readonly string[] = ["/api/books", "/api/games"];
 
 // Signed-in users are sent from these to their library
 export const AUTH_PAGES: readonly string[] = ["/login", "/signup"];
