@@ -18,6 +18,8 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import Navbar from "../../components/Navbar";
 import { supabase } from "../../../lib/supabase";
+import StoryCardSheet from "./_components/StoryCardSheet";
+import type { CardKind } from "./_lib/storyCard";
 
 // ============================================================
 // Types
@@ -452,6 +454,9 @@ export default function BookReviewPage() {
   const [savingEdit, setSavingEdit] = useState(false);
   const [editError, setEditError] = useState("");
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+
+  // Story card (social media image)
+  const [storyKind, setStoryKind] = useState<CardKind | null>(null);
 
   // UI
   const [showLeaveModal, setShowLeaveModal] = useState(false);
@@ -1599,7 +1604,7 @@ export default function BookReviewPage() {
               </div>
             )}
 
-            <div className="grid grid-cols-2 sm:flex gap-3 mt-6">
+            <div className="grid grid-cols-2 sm:flex sm:flex-wrap gap-3 mt-6">
               <button type="button" onClick={goToComposer} className={btnPrimary}>
                 <span aria-hidden="true">✎</span>
                 Add a note
@@ -1607,6 +1612,10 @@ export default function BookReviewPage() {
               <button type="button" onClick={goToReview} className={btnOutline}>
                 <span aria-hidden="true" className="text-[#c5a24a]">★</span>
                 {review ? "Your review" : "Write review"}
+              </button>
+              <button type="button" onClick={() => setStoryKind(isDone ? "review" : "about")} className={`${btnOutline} col-span-2 sm:col-span-1`}>
+                <StoryIcon />
+                Story card
               </button>
             </div>
 
@@ -2321,6 +2330,10 @@ export default function BookReviewPage() {
                   <p className="mt-5 pt-4 border-t border-[#0f172a]/[0.06] text-xs text-slate-400 leading-5">
                     Only you can see this review.
                   </p>
+                  <button type="button" onClick={() => setStoryKind("review")} className={`${btnOutline} w-full mt-4 h-11`}>
+                    <StoryIcon />
+                    Make a story card
+                  </button>
                 </div>
               </aside>
             </div>
@@ -2484,6 +2497,23 @@ export default function BookReviewPage() {
         </div>
       )}
 
+      {/* ================= Story card for social media ================= */}
+      {userId && (
+        <StoryCardSheet
+          open={storyKind !== null}
+          onClose={() => setStoryKind(null)}
+          userId={userId}
+          book={{ id: book.id, title: book.title, author: book.author }}
+          coverSources={coverSources}
+          rating={rating}
+          privateReview={reviewText}
+          finishedYear={review?.finished_year ?? (finishedYear ? Number(finishedYear) : null)}
+          notes={journalEntries}
+          initialKind={storyKind ?? "review"}
+          onToast={showToast}
+        />
+      )}
+
       {/* ================= Unsaved changes modal ================= */}
       {showLeaveModal && (
         <div
@@ -2559,6 +2589,16 @@ function UploadIcon() {
     <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <path d="M12 16V4M7 9l5-5 5 5" />
       <path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3" />
+    </svg>
+  );
+}
+
+function StoryIcon() {
+  return (
+    <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="6" y="2.5" width="12" height="19" rx="2.5" />
+      <path d="M9.5 15.5h5M9.5 18h3" />
+      <rect x="9" y="6" width="6" height="7" rx="1" />
     </svg>
   );
 }
